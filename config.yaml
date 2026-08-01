@@ -15,8 +15,8 @@ douyin:
 # 新用户有免费额度，按量计费约 $0.01/次
 tikhub:
   api_key: ""
-  # 默认 .io；国内本地测试被墙时改成 https://api.tikhub.dev/api/v1
-  base_url: "https://api.tikhub.io/api/v1"
+  # .dev 域名国内外均可访问，更稳定；.io 在国内/GitHub Actions 偶发连接中断
+  base_url: "https://api.tikhub.dev/api/v1"
 
 # 大模型 API 配置（用于内容总结）
 # 推荐 DeepSeek：便宜、中文好、国内可访问
@@ -48,7 +48,7 @@ push:
 
 # 运行配置
 runtime:
-  lookback_hours: 24               # 向前查看多少小时的视频
-  max_videos_per_run: 5            # 每次最多处理几个视频
+  lookback_hours: 168              # 临时调整为7天，用于首次全链路测试；测试完成后改回24
+  max_videos_per_run: 1            # 测试期间只处理1条，避免消耗过多
   temp_dir: "./temp"               # 临时文件目录
   state_file: "state.json"         # 状态文件（记录已处理的视频）
