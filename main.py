@@ -51,6 +51,9 @@ class Config:
                 file_config = yaml.safe_load(f) or {}
 
         # 抖音账号
+        douyin_env_enabled = os.environ.get('DOUYIN_ENABLED', '').lower()
+        self.douyin_enabled = (douyin_env_enabled == 'true') or \
+            (douyin_env_enabled == '' and file_config.get('douyin', {}).get('enabled', False))
         self.douyin_unique_id = os.environ.get('DOUYIN_UNIQUE_ID') or \
             file_config.get('douyin', {}).get('unique_id', 'zhenrutie001')
         self.douyin_sec_uid = os.environ.get('DOUYIN_SEC_UID') or \
@@ -1516,7 +1519,8 @@ class PushNotifier:
 # ============================================================
 # 消息格式化
 # ============================================================
-def format_message(main_nickname: str, summaries: list) -> tuple:
+def format_message(main_nickname: str, summaries: list,
+                   douyin_enabled: bool = True, wechat_enabled: bool = True) -> tuple:
     """将多条视频总结格式化为一条推送消息"""
     now_bjt = datetime.now(BJT)
     date_str = now_bjt.strftime('%Y年%m月%d日')
@@ -1526,10 +1530,18 @@ def format_message(main_nickname: str, summaries: list) -> tuple:
 
     title = f"{main_nickname} 今日股市观点 ({date_str})"
 
+    # 根据启用的平台生成统计行
+    count_parts = []
+    if douyin_enabled:
+        count_parts.append(f"抖音 {douyin_count} 条")
+    if wechat_enabled:
+        count_parts.append(f"视频号 {wechat_count} 条")
+    count_str = " | ".join(count_parts) if count_parts else "无视频"
+
     parts = [
         f"## 🎬 {main_nickname} 今日股市观点",
         f"",
-        f"> 📅 {date_str} | 抖音 {douyin_count} 条 | 视频号 {wechat_count} 条",
+        f"> 📅 {date_str} | {count_str}",
         f"> 🤖 AI自动总结，仅供参考",
         f"",
         f"---",
@@ -1635,7 +1647,10 @@ def main():
 
     # 1. 加载配置
     config = Config()
-    logger.info(f"抖音监控: {config.douyin_nickname} (抖音号: {config.douyin_unique_id})")
+    if config.douyin_enabled:
+        logger.info(f"抖音监控: {config.douyin_nickname} (抖音号: {config.douyin_unique_id})")
+    else:
+        logger.info("抖音监控: 已禁用")
     if config.wechat_enabled:
         logger.info(f"视频号监控: {config.wechat_nickname} (channel_id: {config.wechat_channel_id})")
     else:
@@ -1649,21 +1664,24 @@ def main():
     all_summaries = []
 
     # 3. 处理抖音视频
-    logger.info("\n" + "-" * 60)
-    logger.info("【抖音】开始获取最新视频")
-    logger.info("-" * 60)
-    douyin_monitor = DouyinMonitor(config)
-    douyin_videos = douyin_monitor.get_latest_videos()
-    if douyin_videos:
-        douyin_new = douyin_monitor.filter_new_videos(douyin_videos, state)
-        for video in douyin_new:
-            result = process_single_video(video, processor, config, is_wechat=False)
-            if result:
-                all_summaries.append(result)
-            state.mark_processed(video["id"], video["create_time"])
-            time.sleep(2)
+    if config.douyin_enabled:
+        logger.info("\n" + "-" * 60)
+        logger.info("【抖音】开始获取最新视频")
+        logger.info("-" * 60)
+        douyin_monitor = DouyinMonitor(config)
+        douyin_videos = douyin_monitor.get_latest_videos()
+        if douyin_videos:
+            douyin_new = douyin_monitor.filter_new_videos(douyin_videos, state)
+            for video in douyin_new:
+                result = process_single_video(video, processor, config, is_wechat=False)
+                if result:
+                    all_summaries.append(result)
+                state.mark_processed(video["id"], video["create_time"])
+                time.sleep(2)
+        else:
+            logger.warning("未获取到抖音视频")
     else:
-        logger.warning("未获取到抖音视频")
+        logger.info("抖音监控已禁用，跳过")
 
     # 4. 处理微信视频号视频
     if config.wechat_enabled:
@@ -1688,7 +1706,9 @@ def main():
 
     # 6. 推送通知
     if all_summaries:
-        title, content = format_message(config.douyin_nickname, all_summaries)
+        # 根据启用的平台选择主昵称
+        main_nickname = config.wechat_nickname if not config.douyin_enabled else config.douyin_nickname
+        title, content = format_message(main_nickname, all_summaries, config.douyin_enabled, config.wechat_enabled)
         logger.info(f"准备推送: {title}")
         success = notifier.push(title, content)
 
