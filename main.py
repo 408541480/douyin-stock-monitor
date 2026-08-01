@@ -864,26 +864,31 @@ class VideoProcessor:
     def _get_wechat_playable_url(self, video_id: str, username: str, share_url: str) -> Optional[str]:
         """
         通过 TikHub fetch_video_detail 接口获取可播放的视频 URL。
-        fetch_user_videos 返回的 media.full_url 可能是加密的 encfilekey URL，
-        fetch_video_detail 可能返回不同的可播放 URL。
+        尝试 raw=False 和 raw=True 两种模式，并记录完整响应结构用于调试。
         """
         if not self._wechat_session:
             return None
 
-        # 尝试多种参数组合
+        # 尝试多种参数组合（包括 raw=True 获取原始响应）
         payloads = []
-        if username and video_id:
-            payloads.append({"username": username, "video_id": video_id, "raw": False})
         if share_url:
             payloads.append({"share_url": share_url, "raw": False})
+            payloads.append({"share_url": share_url, "raw": True})
+        if username and video_id:
+            payloads.append({"username": username, "video_id": video_id, "raw": False})
+            payloads.append({"username": username, "video_id": video_id, "raw": True})
 
         for payload in payloads:
             try:
-                logger.info(f"调用 fetch_video_detail 获取可播放URL: {list(payload.keys())}")
+                raw_flag = payload.get("raw", False)
+                logger.info(f"调用 fetch_video_detail: params={list(payload.keys())}, raw={raw_flag}")
                 url = f"{self.WECHAT_API_BASE}/wechat_channels/v2/fetch_video_detail"
                 resp = self._wechat_session.post(url, json=payload, timeout=30)
                 resp.raise_for_status()
                 data = resp.json().get("data", {})
+
+                # 记录响应的顶层键和所有 URL-like 字符串
+                self._log_wechat_response_structure(data, prefix="fetch_video_detail")
 
                 # 在响应中递归搜索 URL 字段，排除 encfilekey 加密 URL
                 playable_url = self._find_playable_url(data)
@@ -891,11 +896,36 @@ class VideoProcessor:
                     logger.info(f"fetch_video_detail 返回可播放URL: {playable_url[:80]}...")
                     return playable_url
 
-                logger.warning(f"fetch_video_detail 响应中未找到可播放URL")
+                logger.warning(f"fetch_video_detail 响应中未找到可播放URL (raw={raw_flag})")
             except Exception as e:
-                logger.warning(f"fetch_video_detail 调用失败: {e}")
+                logger.warning(f"fetch_video_detail 调用失败 (params={list(payload.keys())}): {e}")
 
         return None
+
+    def _log_wechat_response_structure(self, data, prefix="", depth=0):
+        """记录微信API响应的结构（键名和URL-like字符串），用于调试"""
+        if depth > 5:
+            return
+        indent = "  " * depth
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, str) and len(value) > 30:
+                    # 记录长字符串（可能是URL）
+                    has_enc = "encfilekey" in value.lower()
+                    is_url = value.startswith("http")
+                    if is_url:
+                        logger.info(f"{prefix} [{indent}{key}] URL(enc={has_enc}): {value[:100]}...")
+                    elif not has_enc and len(value) < 200:
+                        logger.info(f"{prefix} [{indent}{key}] = {value[:100]}")
+                elif isinstance(value, (dict, list)):
+                    logger.info(f"{prefix} [{indent}{key}]: {type(value).__name__}({len(value)})")
+                    self._log_wechat_response_structure(value, prefix, depth + 1)
+                elif value is not None and not isinstance(value, bool):
+                    logger.info(f"{prefix} [{indent}{key}] = {value}")
+        elif isinstance(data, list) and len(data) > 0:
+            # 只检查第一个元素
+            self._log_wechat_response_structure(data[0], prefix, depth + 1)
 
     def _find_playable_url(self, data, depth=0) -> Optional[str]:
         """在嵌套字典/列表中递归查找可播放的视频 URL（排除 encfilekey 加密 URL）"""
