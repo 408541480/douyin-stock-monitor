@@ -267,7 +267,7 @@ class DouyinMonitor:
             return []
 
         params = {
-            "count": 10,
+            "count": 20,
             "max_cursor": 0,
         }
         if sec_uid:
