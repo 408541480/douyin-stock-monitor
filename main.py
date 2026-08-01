@@ -324,15 +324,24 @@ class DouyinMonitor:
         """筛选出新的、未处理的视频"""
         now_ts = int(time.time())
         cutoff_ts = now_ts - self.config.lookback_hours * 3600
+        cutoff_dt = datetime.fromtimestamp(cutoff_ts, tz=BJT)
+
+        logger.info(f"时间窗口: 只处理 {self.config.lookback_hours} 小时内 (即 {cutoff_dt.strftime('%Y-%m-%d %H:%M')} 之后) 的视频")
 
         new_videos = []
         for v in videos:
+            video_dt = datetime.fromtimestamp(v["create_time"], tz=BJT) if v["create_time"] > 0 else None
+            date_str = video_dt.strftime('%Y-%m-%d %H:%M') if video_dt else "无时间"
+
             # 跳过已处理的
             if state.is_processed(v["id"]):
+                logger.info(f"  跳过已处理: {v['id']} ({date_str}) {v['title'][:30]}")
                 continue
             # 只处理 lookback_hours 时间内的视频
             if v["create_time"] > 0 and v["create_time"] < cutoff_ts:
+                logger.info(f"  跳过超期: {v['id']} ({date_str}) {v['title'][:30]}")
                 continue
+            logger.info(f"  新视频: {v['id']} ({date_str}) {v['title'][:30]}")
             new_videos.append(v)
 
         # 限制每次处理的数量
