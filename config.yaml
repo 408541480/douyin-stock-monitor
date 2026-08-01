@@ -1,0 +1,54 @@
+# ============================================
+# 抖音账号视频自动总结 - 配置文件
+# ============================================
+# 本地运行时使用此文件配置
+# GitHub Actions 运行时通过 Secrets 环境变量覆盖
+
+# 抖音账号配置
+douyin:
+  unique_id: "zhenrutie001"       # 抖音号（用户提供的）
+  sec_uid: "MS4wLjABAAAAf0C1gFEdMvoFGiiMUZbYQeLVpezDCv4fyNjWk9W2myE"  # 已验证，预填可省一次API调用
+  nickname: "真如铁"                # 昵称（用于推送消息标题）
+
+# TikHub API 配置（用于获取抖音用户视频列表）
+# 注册地址: https://user.tikhub.io
+# 新用户有免费额度，按量计费约 $0.01/次
+tikhub:
+  api_key: ""
+  # 默认 .io；国内本地测试被墙时改成 https://api.tikhub.dev/api/v1
+  base_url: "https://api.tikhub.io/api/v1"
+
+# 大模型 API 配置（用于内容总结）
+# 推荐 DeepSeek：便宜、中文好、国内可访问
+# 注册地址: https://platform.deepseek.com
+llm:
+  provider: "deepseek"             # deepseek / openai / qwen
+  api_key: ""
+  base_url: "https://api.deepseek.com/v1"
+  model: "deepseek-chat"
+
+# Whisper 语音转文字配置
+whisper:
+  model_size: "base"               # tiny / base / small / medium（越大越准但越慢）
+  language: "zh"                   # 语言
+  device: "cpu"                    # cpu / cuda
+
+# 推送配置
+push:
+  method: "serverchan"             # serverchan（Server酱）/ wecom（企业微信机器人）
+
+  # Server酱（推荐，最简单）
+  # 注册地址: https://sct.ftqq.com
+  # 微信扫码登录后获取 SendKey
+  serverchan_key: ""
+
+  # 企业微信机器人（备选）
+  # 在企业微信群聊中添加机器人，获取 Webhook URL
+  wecom_webhook: ""
+
+# 运行配置
+runtime:
+  lookback_hours: 24               # 向前查看多少小时的视频
+  max_videos_per_run: 5            # 每次最多处理几个视频
+  temp_dir: "./temp"               # 临时文件目录
+  state_file: "state.json"         # 状态文件（记录已处理的视频）
