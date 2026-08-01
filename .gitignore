@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+*.mp3
+*.mp4
+*.wav
+downloads/
+_openapi.json
