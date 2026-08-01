@@ -569,6 +569,7 @@ class WeChatChannelsMonitor:
         """解析视频号视频数据，统一格式"""
         parsed = []
         share_url_base = self._build_share_url()
+        username = self.config.wechat_username
 
         for v in raw_videos:
             try:
@@ -586,7 +587,13 @@ class WeChatChannelsMonitor:
                 create_time = v.get("create_time") or 0
                 media = v.get("media", {})
                 duration = media.get("duration") or 0
-                media_url = media.get("full_url") or media.get("url") or ""
+                # 尝试多个 URL 字段
+                media_url = media.get("full_url") or media.get("url") or media.get("mp4_url") or ""
+
+                # 记录 media 对象的可用字段（调试用）
+                if media_url and "encfilekey" in media_url.lower():
+                    media_keys = list(media.keys()) if isinstance(media, dict) else "N/A"
+                    logger.info(f"视频 {video_id} media字段: {media_keys}")
 
                 parsed.append({
                     "id": video_id,
@@ -595,6 +602,7 @@ class WeChatChannelsMonitor:
                     "duration_sec": int(duration),
                     "share_url": share_url_base,
                     "media_url": media_url,
+                    "username": username,
                     "digg_count": v.get("like_count", 0),
                     "comment_count": v.get("comment_count", 0),
                     "collect_count": v.get("fav_count", 0),
@@ -620,6 +628,9 @@ class WeChatChannelsMonitor:
 class VideoProcessor:
     """下载视频音频、语音转文字、AI总结"""
 
+    # 微信视频号 V2 API 仅在 .io 域名稳定
+    WECHAT_API_BASE = "https://api.tikhub.io/api/v1"
+
     def __init__(self, config: Config):
         self.config = config
         self.temp_dir = Path(config.temp_dir)
@@ -633,6 +644,17 @@ class VideoProcessor:
             self._tikhub_session.headers.update({
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "application/json",
+                "Authorization": f"Bearer {config.tikhub_api_key}",
+            })
+
+        # 微信视频号 API 会话（POST + JSON body）
+        self._wechat_session = None
+        if config.tikhub_api_key:
+            self._wechat_session = requests.Session()
+            self._wechat_session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
                 "Authorization": f"Bearer {config.tikhub_api_key}",
             })
 
@@ -839,10 +861,122 @@ class VideoProcessor:
             logger.warning(f"ffprobe 异常: {e}")
             return True  # 不阻止后续尝试
 
-    def download_audio_from_video_url(self, video_url: str, video_id: str) -> Optional[str]:
+    def _get_wechat_playable_url(self, video_id: str, username: str, share_url: str) -> Optional[str]:
+        """
+        通过 TikHub fetch_video_detail 接口获取可播放的视频 URL。
+        fetch_user_videos 返回的 media.full_url 可能是加密的 encfilekey URL，
+        fetch_video_detail 可能返回不同的可播放 URL。
+        """
+        if not self._wechat_session:
+            return None
+
+        # 尝试多种参数组合
+        payloads = []
+        if username and video_id:
+            payloads.append({"username": username, "video_id": video_id, "raw": False})
+        if share_url:
+            payloads.append({"share_url": share_url, "raw": False})
+
+        for payload in payloads:
+            try:
+                logger.info(f"调用 fetch_video_detail 获取可播放URL: {list(payload.keys())}")
+                url = f"{self.WECHAT_API_BASE}/wechat_channels/v2/fetch_video_detail"
+                resp = self._wechat_session.post(url, json=payload, timeout=30)
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+
+                # 在响应中递归搜索 URL 字段，排除 encfilekey 加密 URL
+                playable_url = self._find_playable_url(data)
+                if playable_url:
+                    logger.info(f"fetch_video_detail 返回可播放URL: {playable_url[:80]}...")
+                    return playable_url
+
+                logger.warning(f"fetch_video_detail 响应中未找到可播放URL")
+            except Exception as e:
+                logger.warning(f"fetch_video_detail 调用失败: {e}")
+
+        return None
+
+    def _find_playable_url(self, data, depth=0) -> Optional[str]:
+        """在嵌套字典/列表中递归查找可播放的视频 URL（排除 encfilekey 加密 URL）"""
+        if depth > 10:
+            return None
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, str) and len(value) > 20:
+                    lower = value.lower()
+                    # 排除 encfilekey 加密 URL
+                    if "encfilekey" in lower:
+                        continue
+                    # 匹配视频 URL 模式
+                    if any(domain in lower for domain in ["tc.qq.com", "mpvideo.qpic.cn", "wxapp"]) \
+                            and value.startswith("http"):
+                        return value
+                    # 匹配其他可能的视频 URL
+                    if key.lower() in ("url", "full_url", "play_url", "mp4_url", "video_url", "download_url") \
+                            and value.startswith("http") and "encfilekey" not in lower:
+                        return value
+                elif isinstance(value, (dict, list)):
+                    result = self._find_playable_url(value, depth + 1)
+                    if result:
+                        return result
+        elif isinstance(data, list):
+            for item in data:
+                result = self._find_playable_url(item, depth + 1)
+                if result:
+                    return result
+        return None
+
+    def _download_video_file(self, video_url: str, video_path: Path) -> Optional[int]:
+        """
+        下载视频文件到指定路径，返回文件大小（字节），失败返回 None。
+        尝试 HTTP→HTTPS 升级和 Range header。
+        """
+        urls_to_try = [video_url]
+        # 尝试 HTTPS 升级
+        if video_url.startswith("http://"):
+            urls_to_try.append(video_url.replace("http://", "https://", 1))
+
+        for url in urls_to_try:
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "https://channels.weixin.qq.com/",
+                    "Accept": "*/*",
+                    "Range": "bytes=0-",  # 某些 CDN 需要 Range header 才能返回视频数据
+                }
+                resp = requests.get(url, headers=headers, timeout=180, stream=True)
+                resp.raise_for_status()
+
+                content_length = resp.headers.get("Content-Length")
+                if content_length:
+                    logger.info(f"预期视频大小: {int(content_length) / 1024 / 1024:.2f} MB")
+
+                total_size = 0
+                with open(video_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            total_size += len(chunk)
+
+                if total_size > 10240:
+                    logger.info(f"视频下载完成: {video_path} ({total_size / 1024 / 1024:.2f} MB)")
+                    return total_size
+                else:
+                    logger.warning(f"下载文件过小 ({total_size} bytes)，尝试下一个URL")
+                    video_path.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"下载失败 ({url[:60]}...): {e}")
+                video_path.unlink(missing_ok=True)
+
+        return None
+
+    def download_audio_from_video_url(self, video_url: str, video_id: str,
+                                       username: str = "", share_url: str = "") -> Optional[str]:
         """
         下载微信视频号视频并提取音频。
-        尝试顺序：MP3 → AAC → WAV → 直接传视频文件给 Whisper。
+        流程：直接URL → (失败时) fetch_video_detail获取新URL → 音频提取 → Whisper直传。
         """
         audio_path = self.temp_dir / f"{video_id}.mp3"
         video_path = self.temp_dir / f"{video_id}.mp4"
@@ -858,47 +992,64 @@ class VideoProcessor:
             logger.error("视频号 media_url 为空，无法下载")
             return None
 
-        try:
-            logger.info(f"下载视频号视频: {video_url[:80]}...")
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://channels.weixin.qq.com/",
-                "Accept": "*/*",
-            }
-            resp = requests.get(video_url, headers=headers, timeout=180, stream=True)
-            resp.raise_for_status()
+        # 收集所有可能的 URL 来源
+        urls_to_try = [video_url]
 
-            # 记录预期文件大小
-            content_length = resp.headers.get("Content-Length")
-            if content_length:
-                logger.info(f"预期视频大小: {int(content_length) / 1024 / 1024:.2f} MB")
+        # 如果第一个 URL 包含 encfilekey（加密URL），提前获取 fallback
+        if "encfilekey" in video_url.lower():
+            logger.warning("视频URL包含encfilekey（加密URL），尝试通过fetch_video_detail获取可播放URL")
+            playable = self._get_wechat_playable_url(video_id, username, share_url)
+            if playable and playable != video_url:
+                urls_to_try.append(playable)
 
-            total_size = 0
-            with open(video_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        total_size += len(chunk)
-
-            logger.info(f"视频下载完成: {video_path} ({total_size / 1024 / 1024:.2f} MB)")
-
-            # 检查文件完整性
-            if total_size < 10240:
-                logger.error(f"视频文件过小 ({total_size} bytes)，可能下载不完整")
-                video_path.unlink(missing_ok=True)
-                return None
+        for current_url in urls_to_try:
+            # 下载视频
+            file_size = self._download_video_file(current_url, video_path)
+            if not file_size:
+                continue
 
             # 检查是否为有效的视频文件（检查 magic bytes）
             with open(video_path, 'rb') as f:
                 magic = f.read(12)
-            if len(magic) < 8 or (b'ftyp' not in magic and b'\x1a\x45\xdf\xa3' not in magic[:4]):
-                # 可能下载到了错误页面（HTML/JSON），读取前100字节查看
+
+            is_valid_video = (
+                len(magic) >= 8 and (
+                    b'ftyp' in magic or           # MP4/MOV
+                    b'\x1a\x45\xdf\xa3' in magic[:4] or  # MKV/WebM
+                    b'FLV' in magic[:3] or         # FLV
+                    b'\x00\x00\x01' in magic[:4]   # MPEG-TS
+                )
+            )
+
+            if not is_valid_video:
                 with open(video_path, 'rb') as f:
                     head = f.read(200)
-                logger.error(f"视频文件不是有效的视频格式，前200字节: {head[:200]}")
+                logger.warning(f"URL返回的不是有效视频格式 (URL: {current_url[:60]}...)，前20字节hex: {head[:20].hex()}")
                 video_path.unlink(missing_ok=True)
-                return None
 
+                # 如果还有其他URL可试，继续
+                if current_url != urls_to_try[-1]:
+                    continue
+
+                # 所有URL都失败了，最后尝试一次 fetch_video_detail（如果还没试过）
+                if len(urls_to_try) == 1:
+                    logger.info("所有直接URL失败，尝试通过fetch_video_detail获取可播放URL")
+                    playable = self._get_wechat_playable_url(video_id, username, share_url)
+                    if playable and playable not in urls_to_try:
+                        file_size = self._download_video_file(playable, video_path)
+                        if file_size:
+                            with open(video_path, 'rb') as f:
+                                magic = f.read(12)
+                            if b'ftyp' in magic or b'\x1a\x45\xdf\xa3' in magic[:4] or b'FLV' in magic[:3]:
+                                is_valid_video = True
+                            else:
+                                video_path.unlink(missing_ok=True)
+
+                if not is_valid_video:
+                    logger.error("无法获取可播放的视频文件")
+                    return None
+
+            # 到这里说明视频文件是有效的
             # 用 ffprobe 检查音频流
             self._probe_video(video_path)
 
@@ -906,27 +1057,16 @@ class VideoProcessor:
             audio_result = self._run_ffmpeg_extract(video_path, audio_path)
 
             if audio_result:
-                # 提取成功，删除视频文件
                 video_path.unlink(missing_ok=True)
                 return audio_result
 
-            # 所有提取策略失败 —— 尝试直接传视频文件给 Whisper
-            # faster-whisper 底层用 ffmpeg 解码，可以直接处理视频文件
+            # 音频提取失败 —— 尝试直接传视频文件给 Whisper
             logger.warning("音频提取全部失败，尝试直接使用视频文件进行转录")
             if video_path.exists() and video_path.stat().st_size > 10240:
                 logger.info(f"使用视频文件直接转录: {video_path}")
                 return str(video_path)
 
             logger.error("视频文件不可用，无法转录")
-            video_path.unlink(missing_ok=True)
-            return None
-
-        except subprocess.TimeoutExpired:
-            logger.error("视频下载/提取超时")
-            video_path.unlink(missing_ok=True)
-            return None
-        except Exception as e:
-            logger.error(f"下载视频号视频失败: {e}")
             video_path.unlink(missing_ok=True)
             return None
 
@@ -1195,7 +1335,10 @@ def process_single_video(video: dict, processor: VideoProcessor, config: Config,
 
     # 下载音频
     if is_wechat:
-        audio_path = processor.download_audio_from_video_url(video.get("media_url", ""), video["id"])
+        audio_path = processor.download_audio_from_video_url(
+            video.get("media_url", ""), video["id"],
+            username=video.get("username", ""), share_url=video.get("share_url", "")
+        )
     else:
         audio_path = processor.download_audio(video["share_url"], video["id"])
 
