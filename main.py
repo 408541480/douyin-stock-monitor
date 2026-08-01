@@ -59,10 +59,10 @@ class Config:
         # TikHub API
         self.tikhub_api_key = os.environ.get('TIKHUB_API_KEY') or \
             file_config.get('tikhub', {}).get('api_key', '')
-        # .io 域名在国内被墙；本地测试可改用 https://api.tikhub.dev/api/v1
-        # GitHub Actions 在海外运行，默认 .io 不受影响
+        # .dev 域名国内外均可访问，更稳定
+        # .io 在国内被墙，且在 GitHub Actions 环境偶发 "Response ended prematurely"（响应被截断）
         self.tikhub_base_url = os.environ.get('TIKHUB_BASE_URL') or \
-            file_config.get('tikhub', {}).get('base_url', 'https://api.tikhub.io/api/v1')
+            file_config.get('tikhub', {}).get('base_url', 'https://api.tikhub.dev/api/v1')
 
         # LLM
         llm_cfg = file_config.get('llm', {})
@@ -218,14 +218,10 @@ class DouyinMonitor:
             return []
 
         try:
-            # 尝试多个可能的 API 端点
-            endpoints = [
-                f"{self.TIKHUB_BASE}/douyin/web/fetch_user_post_videos",
-                f"{self.TIKHUB_BASE}/douyin/app/v3/fetch_user_post_videos",
-            ]
+            endpoint = f"{self.TIKHUB_BASE}/douyin/web/fetch_user_post_videos"
 
             params = {
-                "count": 20,
+                "count": 10,
                 "max_cursor": 0,
             }
             if sec_uid:
@@ -233,10 +229,12 @@ class DouyinMonitor:
             else:
                 params["unique_id"] = self.config.douyin_unique_id
 
-            for endpoint in endpoints:
+            # 重试机制：处理偶发的 "Response ended prematurely"（连接中断）
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
                 try:
-                    logger.info(f"尝试获取视频列表: {endpoint}")
-                    resp = self.session.get(endpoint, params=params, timeout=60)
+                    logger.info(f"尝试获取视频列表 (第{attempt}/{max_retries}次): {endpoint}")
+                    resp = self.session.get(endpoint, params=params, timeout=90)
                     resp.raise_for_status()
                     data = resp.json()
 
@@ -252,11 +250,31 @@ class DouyinMonitor:
                         logger.info(f"获取到 {len(videos)} 条视频")
                         return self._parse_videos(videos)
 
-                except requests.RequestException as e:
-                    logger.warning(f"端点 {endpoint} 请求失败: {e}")
-                    continue
+                    logger.warning(f"响应中无视频数据")
+                    if attempt < max_retries:
+                        time.sleep(3)
+                        continue
+                    return []
 
-            logger.error("所有端点均未能获取视频列表")
+                except (requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.ReadTimeout) as e:
+                    logger.warning(f"第{attempt}次请求连接中断: {type(e).__name__}: {e}")
+                    if attempt < max_retries:
+                        time.sleep(3)
+                    else:
+                        logger.error("所有重试均因连接中断失败")
+                        return []
+
+                except requests.RequestException as e:
+                    logger.warning(f"第{attempt}次请求失败: {e}")
+                    if attempt < max_retries:
+                        time.sleep(3)
+                    else:
+                        logger.error(f"请求失败，已达最大重试次数: {e}")
+                        return []
+
+            logger.error("未能获取视频列表")
             return []
 
         except Exception as e:
