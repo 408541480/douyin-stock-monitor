@@ -205,8 +205,57 @@ class DouyinMonitor:
             logger.error(f"获取 sec_uid 失败: {e}")
             return None
 
+    def _fetch_videos_once(self, base_url: str, params: dict, max_retries: int = 5) -> list:
+        """向指定域名请求视频列表，含指数退避重试"""
+        endpoint = f"{base_url}/douyin/web/fetch_user_post_videos"
+        backoff = [3, 5, 10, 15, 20]
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"尝试获取视频列表 (第{attempt}/{max_retries}次): {endpoint}")
+                resp = self.session.get(endpoint, params=params, timeout=90)
+                resp.raise_for_status()
+                data = resp.json()
+
+                videos = (
+                    data.get("data", {}).get("aweme_list") or
+                    data.get("data", {}).get("videos") or
+                    data.get("aweme_list") or
+                    []
+                )
+
+                if videos:
+                    logger.info(f"获取到 {len(videos)} 条视频")
+                    return videos
+
+                logger.warning(f"响应中无视频数据")
+                if attempt < max_retries:
+                    time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+                    continue
+                return []
+
+            except (requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ReadTimeout) as e:
+                logger.warning(f"第{attempt}次请求连接中断: {type(e).__name__}: {e}")
+                if attempt < max_retries:
+                    time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+                else:
+                    logger.error(f"{base_url} 所有重试均因连接中断失败")
+                    return []
+
+            except requests.RequestException as e:
+                logger.warning(f"第{attempt}次请求失败: {e}")
+                if attempt < max_retries:
+                    time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+                else:
+                    logger.error(f"{base_url} 请求失败，已达最大重试次数: {e}")
+                    return []
+
+        return []
+
     def get_latest_videos(self) -> list:
-        """获取最新视频列表"""
+        """获取最新视频列表，主域名失败后回退另一域名"""
         sec_uid = self.get_sec_uid()
 
         if not sec_uid and not self.config.tikhub_api_key:
@@ -217,69 +266,32 @@ class DouyinMonitor:
             logger.error("缺少 TikHub API Key")
             return []
 
-        try:
-            endpoint = f"{self.TIKHUB_BASE}/douyin/web/fetch_user_post_videos"
+        params = {
+            "count": 10,
+            "max_cursor": 0,
+        }
+        if sec_uid:
+            params["sec_user_id"] = sec_uid
+        else:
+            params["unique_id"] = self.config.douyin_unique_id
 
-            params = {
-                "count": 10,
-                "max_cursor": 0,
-            }
-            if sec_uid:
-                params["sec_user_id"] = sec_uid
-            else:
-                params["unique_id"] = self.config.douyin_unique_id
+        # 主域名
+        primary_base = self.TIKHUB_BASE
+        videos = self._fetch_videos_once(primary_base, params)
+        if videos:
+            return self._parse_videos(videos)
 
-            # 重试机制：处理偶发的 "Response ended prematurely"（连接中断）
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    logger.info(f"尝试获取视频列表 (第{attempt}/{max_retries}次): {endpoint}")
-                    resp = self.session.get(endpoint, params=params, timeout=90)
-                    resp.raise_for_status()
-                    data = resp.json()
+        # 回退另一域名
+        fallback_base = primary_base.replace("api.tikhub.io", "api.tikhub.dev") if "api.tikhub.io" in primary_base \
+            else primary_base.replace("api.tikhub.dev", "api.tikhub.io")
+        if fallback_base != primary_base:
+            logger.warning(f"主域名失败，尝试回退域名: {fallback_base}")
+            videos = self._fetch_videos_once(fallback_base, params, max_retries=3)
+            if videos:
+                return self._parse_videos(videos)
 
-                    # 尝试多种可能的响应结构
-                    videos = (
-                        data.get("data", {}).get("aweme_list") or
-                        data.get("data", {}).get("videos") or
-                        data.get("aweme_list") or
-                        []
-                    )
-
-                    if videos:
-                        logger.info(f"获取到 {len(videos)} 条视频")
-                        return self._parse_videos(videos)
-
-                    logger.warning(f"响应中无视频数据")
-                    if attempt < max_retries:
-                        time.sleep(3)
-                        continue
-                    return []
-
-                except (requests.exceptions.ChunkedEncodingError,
-                        requests.exceptions.ConnectionError,
-                        requests.exceptions.ReadTimeout) as e:
-                    logger.warning(f"第{attempt}次请求连接中断: {type(e).__name__}: {e}")
-                    if attempt < max_retries:
-                        time.sleep(3)
-                    else:
-                        logger.error("所有重试均因连接中断失败")
-                        return []
-
-                except requests.RequestException as e:
-                    logger.warning(f"第{attempt}次请求失败: {e}")
-                    if attempt < max_retries:
-                        time.sleep(3)
-                    else:
-                        logger.error(f"请求失败，已达最大重试次数: {e}")
-                        return []
-
-            logger.error("未能获取视频列表")
-            return []
-
-        except Exception as e:
-            logger.error(f"获取视频列表失败: {e}")
-            return []
+        logger.error("所有域名均未能获取视频列表")
+        return []
 
     def _parse_videos(self, raw_videos: list) -> list:
         """解析视频数据，统一格式"""
@@ -372,36 +384,51 @@ class VideoProcessor:
                 "Authorization": f"Bearer {config.tikhub_api_key}",
             })
 
-    def _get_audio_url_from_tikhub(self, video_id: str) -> Optional[str]:
-        """通过 TikHub fetch_one_video 获取无 Cookie 音频直链"""
-        if not self._tikhub_session:
-            return None
-        try:
-            endpoint = f"{self.config.tikhub_base_url}/douyin/web/fetch_one_video"
-            resp = self._tikhub_session.get(endpoint, params={"aweme_id": video_id}, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-
-            aweme = data.get("data", {}).get("aweme_detail", {})
-            # 优先取独立音频流（无视频画面，更小）
-            bit_rate_audio = aweme.get("video", {}).get("bit_rate_audio") or []
-            if bit_rate_audio:
-                url_list = bit_rate_audio[0].get("audio_meta", {}).get("url_list", {})
-                for key in ("main_url", "backup_url", "fallback_url"):
-                    url = url_list.get(key)
-                    if url:
-                        return url
-
-            # 回退到视频播放地址，再让 ffmpeg 提取音频
-            play_addr = aweme.get("video", {}).get("play_addr", {})
-            for url in play_addr.get("url_list", []):
+    def _extract_audio_url(self, aweme: dict) -> Optional[str]:
+        """从 TikHub 返回的 aweme_detail 中提取可用音频/视频 URL"""
+        # 优先取独立音频流（无视频画面，更小）
+        bit_rate_audio = aweme.get("video", {}).get("bit_rate_audio") or []
+        if bit_rate_audio:
+            url_list = bit_rate_audio[0].get("audio_meta", {}).get("url_list", {})
+            for key in ("main_url", "backup_url", "fallback_url"):
+                url = url_list.get(key)
                 if url:
                     return url
 
+        # 回退到视频播放地址，再让 ffmpeg 提取音频
+        play_addr = aweme.get("video", {}).get("play_addr", {})
+        for url in play_addr.get("url_list", []):
+            if url:
+                return url
+
+        return None
+
+    def _get_audio_url_from_tikhub(self, video_id: str) -> Optional[str]:
+        """通过 TikHub fetch_one_video 获取无 Cookie 音频直链（主域名失败则回退）"""
+        if not self._tikhub_session:
             return None
-        except Exception as e:
-            logger.warning(f"TikHub 获取音频直链失败: {e}")
-            return None
+
+        bases = [self.config.tikhub_base_url]
+        fallback_base = self.config.tikhub_base_url.replace("api.tikhub.io", "api.tikhub.dev") if "api.tikhub.io" in self.config.tikhub_base_url \
+            else self.config.tikhub_base_url.replace("api.tikhub.dev", "api.tikhub.io")
+        if fallback_base != self.config.tikhub_base_url:
+            bases.append(fallback_base)
+
+        for base in bases:
+            try:
+                endpoint = f"{base}/douyin/web/fetch_one_video"
+                resp = self._tikhub_session.get(endpoint, params={"aweme_id": video_id}, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                aweme = data.get("data", {}).get("aweme_detail", {})
+                url = self._extract_audio_url(aweme)
+                if url:
+                    return url
+            except Exception as e:
+                logger.warning(f"TikHub {base} 获取音频直链失败: {e}")
+                continue
+
+        return None
 
     def _download_audio_direct(self, audio_url: str, output_path: Path) -> bool:
         """使用 requests 直接下载音频/视频文件"""
