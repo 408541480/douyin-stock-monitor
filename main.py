@@ -611,11 +611,13 @@ class WeChatChannelsMonitor:
                 duration = media.get("duration") or 0
                 # 尝试多个 URL 字段
                 media_url = media.get("full_url") or media.get("url") or media.get("mp4_url") or ""
+                # 直接从 fetch_user_videos 响应中提取 decode_key（避免后续再调 fetch_video_detail）
+                decode_key = str(media.get("decode_key") or "")
 
                 # 记录 media 对象的可用字段（调试用）
                 if media_url and "encfilekey" in media_url.lower():
                     media_keys = list(media.keys()) if isinstance(media, dict) else "N/A"
-                    logger.info(f"视频 {video_id} media字段: {media_keys}")
+                    logger.info(f"视频 {video_id} media字段: {media_keys}, decode_key={decode_key}")
 
                 parsed.append({
                     "id": video_id,
@@ -624,6 +626,7 @@ class WeChatChannelsMonitor:
                     "duration_sec": int(duration),
                     "share_url": share_url_base,
                     "media_url": media_url,
+                    "decode_key": decode_key,
                     "username": username,
                     "digg_count": v.get("like_count", 0),
                     "comment_count": v.get("comment_count", 0),
@@ -1208,15 +1211,17 @@ class VideoProcessor:
         return None
 
     def download_audio_from_video_url(self, video_url: str, video_id: str,
-                                       username: str = "", share_url: str = "") -> Optional[str]:
+                                       username: str = "", share_url: str = "",
+                                       decode_key: str = "") -> Optional[str]:
         """
         下载微信视频号视频并提取音频。
         完整流程：
-        1. 通过 fetch_video_detail 获取 full_url + decode_key
-        2. 下载加密视频
-        3. 用 decode_key 解密（Isaac64 XOR，前128KB）
-        4. 提取音频
-        5. 失败则直接传视频给 Whisper
+        1. 优先使用 fetch_user_videos 已返回的 media_url + decode_key（省一次 API 调用）
+        2. 缺失时通过 fetch_video_detail 获取 full_url + decode_key
+        3. 下载加密视频
+        4. 用 decode_key 解密（Isaac64 XOR，前128KB）
+        5. 提取音频
+        6. 失败则直接传视频给 Whisper
         """
         audio_path = self.temp_dir / f"{video_id}.mp3"
         video_path = self.temp_dir / f"{video_id}.mp4"
@@ -1229,91 +1234,80 @@ class VideoProcessor:
                 logger.info(f"音频文件已存在: {existing}")
                 return str(existing)
 
-        # 步骤1：通过 fetch_video_detail 获取 full_url + decode_key
-        logger.info(f"通过 fetch_video_detail 获取视频URL和解密密钥 (video_id={video_id})")
-        url_and_key = self._get_wechat_video_url_and_key(video_id, username, share_url)
+        # 步骤1：确定下载URL和解密密钥
+        # 优先使用 fetch_user_videos 已返回的 media_url + decode_key（省一次API调用）
+        fetch_url = ""
+        resolved_key = decode_key
 
-        if url_and_key:
-            fetch_url, decode_key = url_and_key
-            logger.info(f"获取到: URL={fetch_url[:80]}..., decode_key={decode_key}")
-
-            # 步骤2：下载加密视频
-            file_size = self._download_video_file(fetch_url, video_path)
-            if file_size:
-                # 步骤3：解密视频
-                if decode_key and decode_key != "0":
-                    logger.info(f"视频需要解密 (decode_key={decode_key})")
-                    # 复制到解密路径，原地解密
-                    shutil.copy2(video_path, decrypted_path)
-                    if self._decrypt_wechat_video(decrypted_path, decode_key):
-                        # 验证解密后的视频
-                        with open(decrypted_path, 'rb') as f:
-                            magic = f.read(12)
-                        if b'ftyp' in magic:
-                            logger.info("解密后视频验证成功 (MP4 ftyp)")
-                            # 用解密后的文件提取音频
-                            self._probe_video(decrypted_path)
-                            audio_result = self._run_ffmpeg_extract(decrypted_path, audio_path)
-                            if audio_result:
-                                video_path.unlink(missing_ok=True)
-                                decrypted_path.unlink(missing_ok=True)
-                                return audio_result
-                            # 音频提取失败，尝试直接传视频给 Whisper
-                            if decrypted_path.exists() and decrypted_path.stat().st_size > 10240:
-                                logger.warning("音频提取失败，使用解密后的视频文件直接转录")
-                                result_path = str(decrypted_path)
-                                video_path.unlink(missing_ok=True)
-                                return result_path
-                        else:
-                            logger.warning(f"解密后视频验证失败，前12字节: {magic[:12].hex()}")
-                    else:
-                        logger.error("视频解密失败")
-                else:
-                    logger.info("视频无需解密 (decode_key 为空或0)")
-                    # 直接尝试提取音频
-                    self._probe_video(video_path)
-                    audio_result = self._run_ffmpeg_extract(video_path, audio_path)
-                    if audio_result:
-                        video_path.unlink(missing_ok=True)
-                        return audio_result
-                    if video_path.exists() and video_path.stat().st_size > 10240:
-                        logger.warning("音频提取失败，使用视频文件直接转录")
-                        return str(video_path)
-
-                # 清理解密文件
-                decrypted_path.unlink(missing_ok=True)
-        else:
-            logger.warning("fetch_video_detail 未返回 URL+key，尝试使用原始 media_url")
-
-        # 回退方案：尝试直接使用 fetch_user_videos 返回的 media_url
         if video_url:
-            logger.info(f"尝试直接下载 media_url: {video_url[:80]}...")
-            file_size = self._download_video_file(video_url, video_path)
-            if file_size:
-                # 检查是否为有效视频
-                with open(video_path, 'rb') as f:
+            fetch_url = video_url
+            if decode_key:
+                logger.info(f"使用 fetch_user_videos 返回的 media_url + decode_key (video_id={video_id}, key={decode_key})")
+            else:
+                logger.info(f"有 media_url 但无 decode_key，尝试 fetch_video_detail 补充 (video_id={video_id})")
+        else:
+            logger.info(f"无 media_url，通过 fetch_video_detail 获取 (video_id={video_id})")
+
+        # 如果缺少 URL 或 decode_key，通过 fetch_video_detail 补充
+        if not fetch_url or not resolved_key:
+            url_and_key = self._get_wechat_video_url_and_key(video_id, username, share_url)
+            if url_and_key:
+                detail_url, detail_key = url_and_key
+                if not fetch_url:
+                    fetch_url = detail_url
+                if not resolved_key:
+                    resolved_key = detail_key
+                logger.info(f"fetch_video_detail 补充: URL={fetch_url[:80]}..., decode_key={resolved_key}")
+            elif not fetch_url:
+                logger.error("无法获取视频URL，fetch_video_detail 和 media_url 均失败")
+                return None
+
+        if not fetch_url:
+            logger.error("无可用视频URL")
+            return None
+
+        # 步骤2：下载视频
+        file_size = self._download_video_file(fetch_url, video_path)
+        if not file_size:
+            logger.error("视频下载失败")
+            return None
+
+        # 步骤3：解密（如需要）
+        use_path = video_path  # 默认使用原始下载文件
+        if resolved_key and resolved_key != "0":
+            logger.info(f"视频需要解密 (decode_key={resolved_key})")
+            shutil.copy2(video_path, decrypted_path)
+            if self._decrypt_wechat_video(decrypted_path, resolved_key):
+                # 验证解密后的视频
+                with open(decrypted_path, 'rb') as f:
                     magic = f.read(12)
-                is_valid = (
-                    len(magic) >= 8 and (
-                        b'ftyp' in magic or
-                        b'\x1a\x45\xdf\xa3' in magic[:4] or
-                        b'FLV' in magic[:3] or
-                        b'\x00\x00\x01' in magic[:4]
-                    )
-                )
-                if is_valid:
-                    logger.info("media_url 下载的视频有效，提取音频")
-                    self._probe_video(video_path)
-                    audio_result = self._run_ffmpeg_extract(video_path, audio_path)
-                    if audio_result:
-                        video_path.unlink(missing_ok=True)
-                        return audio_result
-                    if video_path.exists() and video_path.stat().st_size > 10240:
-                        logger.warning("音频提取失败，使用视频文件直接转录")
-                        return str(video_path)
+                if b'ftyp' in magic:
+                    logger.info("解密后视频验证成功 (MP4 ftyp)")
+                    use_path = decrypted_path
                 else:
-                    logger.warning(f"media_url 下载的不是有效视频，前12字节: {magic[:12].hex()}")
-                    video_path.unlink(missing_ok=True)
+                    logger.warning(f"解密后视频验证失败，前12字节: {magic[:12].hex()}")
+                    # 仍然尝试使用解密后的文件
+                    use_path = decrypted_path
+            else:
+                logger.error("视频解密失败，尝试使用原始文件")
+        else:
+            logger.info("视频无需解密 (decode_key 为空或0)")
+
+        # 步骤4：提取音频
+        self._probe_video(use_path)
+        audio_result = self._run_ffmpeg_extract(use_path, audio_path)
+        if audio_result:
+            video_path.unlink(missing_ok=True)
+            decrypted_path.unlink(missing_ok=True)
+            return audio_result
+
+        # 步骤5：音频提取失败，尝试直接传视频给 Whisper
+        if use_path.exists() and use_path.stat().st_size > 10240:
+            logger.warning("音频提取失败，使用视频文件直接转录")
+            result_path = str(use_path)
+            if use_path != video_path:
+                video_path.unlink(missing_ok=True)
+            return result_path
 
         # 清理临时文件
         video_path.unlink(missing_ok=True)
@@ -1593,7 +1587,8 @@ def process_single_video(video: dict, processor: VideoProcessor, config: Config,
     if is_wechat:
         audio_path = processor.download_audio_from_video_url(
             video.get("media_url", ""), video["id"],
-            username=video.get("username", ""), share_url=video.get("share_url", "")
+            username=video.get("username", ""), share_url=video.get("share_url", ""),
+            decode_key=video.get("decode_key", "")
         )
     else:
         audio_path = processor.download_audio(video["share_url"], video["id"])
