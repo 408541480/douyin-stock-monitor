@@ -4,5 +4,12 @@
   "processed_video_ids": [
     "7665980149565567397",
     "7665720064067231397"
-  ]
+  ],
+  "wechat": {
+    "last_video_id": "14978429159502453335",
+    "last_video_create_time": 1785567898,
+    "processed_video_ids": [
+      "14978429159502453335"
+    ]
+  }
 }
