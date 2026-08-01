@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-抖音账号视频自动总结工具
-=========================
-监控指定抖音账号的新视频 -> 下载音频 -> 语音转文字 -> AI总结 -> 微信推送
+抖音/微信视频号账号视频自动总结工具
+==================================
+监控指定账号的新视频 -> 下载音频 -> 语音转文字 -> AI总结 -> 微信推送
 
 使用方式:
   本地运行:  python main.py
@@ -19,7 +19,7 @@ import requests
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Callable
 
 # ============================================================
 # 日志配置
@@ -55,6 +55,18 @@ class Config:
             file_config.get('douyin', {}).get('sec_uid', '')
         self.douyin_nickname = os.environ.get('DOUYIN_NICKNAME') or \
             file_config.get('douyin', {}).get('nickname', '真如铁')
+
+        # 微信视频号
+        wechat_cfg = file_config.get('wechat_channels', {})
+        wechat_env_enabled = os.environ.get('WECHAT_ENABLED', '').lower()
+        self.wechat_enabled = (wechat_env_enabled == 'true') or \
+            (wechat_env_enabled == '' and wechat_cfg.get('enabled', False))
+        self.wechat_channel_id = os.environ.get('WECHAT_CHANNEL_ID') or \
+            wechat_cfg.get('channel_id', '')
+        self.wechat_username = os.environ.get('WECHAT_USERNAME') or \
+            wechat_cfg.get('username', '')
+        self.wechat_nickname = os.environ.get('WECHAT_NICKNAME') or \
+            wechat_cfg.get('nickname', '微信视频号')
 
         # TikHub API
         self.tikhub_api_key = os.environ.get('TIKHUB_API_KEY') or \
@@ -121,17 +133,32 @@ class StateManager:
         self.state = self._load()
 
     def _load(self) -> dict:
+        default_state = {
+            "last_video_id": "",
+            "last_video_create_time": 0,
+            "processed_video_ids": [],
+            "wechat": {
+                "last_video_id": "",
+                "last_video_create_time": 0,
+                "processed_video_ids": []
+            }
+        }
         if self.state_file.exists():
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
+                # 迁移旧格式：确保 wechat 字段存在
+                for key, value in default_state.items():
+                    if key not in loaded:
+                        loaded[key] = value
+                if "wechat" in loaded:
+                    for key, value in default_state["wechat"].items():
+                        if key not in loaded["wechat"]:
+                            loaded["wechat"][key] = value
+                return loaded
             except (json.JSONDecodeError, IOError):
                 pass
-        return {
-            "last_video_id": "",
-            "last_video_create_time": 0,
-            "processed_video_ids": []
-        }
+        return default_state
 
     def is_processed(self, video_id: str) -> bool:
         return video_id in self.state.get("processed_video_ids", [])
@@ -148,10 +175,62 @@ class StateManager:
         self.state["last_video_create_time"] = create_time
         self._save()
 
+    def is_processed_wechat(self, video_id: str) -> bool:
+        return video_id in self.state.get("wechat", {}).get("processed_video_ids", [])
+
+    def mark_processed_wechat(self, video_id: str, create_time: int):
+        wechat_state = self.state.setdefault("wechat", {
+            "last_video_id": "",
+            "last_video_create_time": 0,
+            "processed_video_ids": []
+        })
+        processed = wechat_state.get("processed_video_ids", [])
+        if video_id not in processed:
+            processed.append(video_id)
+        if len(processed) > 200:
+            processed = processed[-200:]
+        wechat_state["processed_video_ids"] = processed
+        wechat_state["last_video_id"] = video_id
+        wechat_state["last_video_create_time"] = create_time
+        self._save()
+
     def _save(self):
         with open(self.state_file, 'w', encoding='utf-8') as f:
             json.dump(self.state, f, ensure_ascii=False, indent=2)
         logger.info(f"状态已保存到 {self.state_file}")
+
+
+# ============================================================
+# 公共工具
+# ============================================================
+def filter_new_videos(videos: list, config: Config, is_processed: Callable[[str], bool]) -> list:
+    """通用新视频筛选逻辑：按时间和已处理状态过滤"""
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - config.lookback_hours * 3600
+    cutoff_dt = datetime.fromtimestamp(cutoff_ts, tz=BJT)
+
+    logger.info(f"时间窗口: 只处理 {config.lookback_hours} 小时内 (即 {cutoff_dt.strftime('%Y-%m-%d %H:%M')} 之后) 的视频")
+
+    new_videos = []
+    for v in videos:
+        video_dt = datetime.fromtimestamp(v["create_time"], tz=BJT) if v["create_time"] > 0 else None
+        date_str = video_dt.strftime('%Y-%m-%d %H:%M') if video_dt else "无时间"
+
+        # 跳过已处理的
+        if is_processed(v["id"]):
+            logger.info(f"  跳过已处理: {v['id']} ({date_str}) {v['title'][:30]}")
+            continue
+        # 只处理 lookback_hours 时间内的视频
+        if v["create_time"] > 0 and v["create_time"] < cutoff_ts:
+            logger.info(f"  跳过超期: {v['id']} ({date_str}) {v['title'][:30]}")
+            continue
+        logger.info(f"  新视频: {v['id']} ({date_str}) {v['title'][:30]}")
+        new_videos.append(v)
+
+    # 限制每次处理的数量
+    new_videos = new_videos[:config.max_videos]
+    logger.info(f"筛选出 {len(new_videos)} 条新视频需要处理")
+    return new_videos
 
 
 # ============================================================
@@ -323,6 +402,8 @@ class DouyinMonitor:
                     "digg_count": digg_count,
                     "comment_count": comment_count,
                     "collect_count": collect_count,
+                    "platform": "douyin",
+                    "source_nickname": self.config.douyin_nickname,
                 })
             except Exception as e:
                 logger.warning(f"解析视频数据失败: {e}")
@@ -334,32 +415,203 @@ class DouyinMonitor:
 
     def filter_new_videos(self, videos: list, state: StateManager) -> list:
         """筛选出新的、未处理的视频"""
-        now_ts = int(time.time())
-        cutoff_ts = now_ts - self.config.lookback_hours * 3600
-        cutoff_dt = datetime.fromtimestamp(cutoff_ts, tz=BJT)
+        return filter_new_videos(videos, self.config, state.is_processed)
 
-        logger.info(f"时间窗口: 只处理 {self.config.lookback_hours} 小时内 (即 {cutoff_dt.strftime('%Y-%m-%d %H:%M')} 之后) 的视频")
 
-        new_videos = []
-        for v in videos:
-            video_dt = datetime.fromtimestamp(v["create_time"], tz=BJT) if v["create_time"] > 0 else None
-            date_str = video_dt.strftime('%Y-%m-%d %H:%M') if video_dt else "无时间"
+# ============================================================
+# 微信视频号监控
+# ============================================================
+class WeChatChannelsMonitor:
+    """通过 TikHub API 获取微信视频号账号的最新视频列表"""
 
-            # 跳过已处理的
-            if state.is_processed(v["id"]):
-                logger.info(f"  跳过已处理: {v['id']} ({date_str}) {v['title'][:30]}")
+    # 视频号 V2 API 目前只在 .io 域名稳定工作
+    WECHAT_BASE = "https://api.tikhub.io/api/v1"
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        })
+        if config.tikhub_api_key:
+            self.session.headers.update({
+                "Authorization": f"Bearer {config.tikhub_api_key}"
+            })
+        self._username = None
+
+    def resolve_username(self) -> Optional[str]:
+        """解析视频号 finder username（v2_...@finder 格式）"""
+        if self.config.wechat_username:
+            logger.info(f"使用配置中的微信视频号 username")
+            return self.config.wechat_username
+
+        if not self.config.tikhub_api_key:
+            logger.error("缺少 TikHub API Key，无法解析视频号 username")
+            return None
+
+        # 优先通过 share_url / channel_id 解析
+        # 如果只有 channel_id，先尝试转成 username
+        if self.config.wechat_channel_id and self.config.wechat_channel_id.startswith("sph"):
+            try:
+                logger.info(f"通过 channel_id 解析 username: {self.config.wechat_channel_id}")
+                url = f"{self.WECHAT_BASE}/wechat_channels/v2/fetch_channel_id_to_username"
+                resp = self.session.post(url, json={"channel_id": self.config.wechat_channel_id}, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+
+                # 在响应中搜索 v2_...@finder 格式的 username
+                username = self._extract_username_from_nested(data)
+                if username:
+                    logger.info(f"解析到 username: {username[:30]}...")
+                    return username
+
+                logger.warning(f"channel_id 响应中未找到 username: {json.dumps(data, ensure_ascii=False)[:300]}")
+            except Exception as e:
+                logger.warning(f"通过 channel_id 解析 username 失败: {e}")
+
+        # 通过视频分享链接解析（兜底）
+        share_url = self._build_share_url()
+        if share_url:
+            try:
+                logger.info(f"通过 share_url 解析 username: {share_url}")
+                url = f"{self.WECHAT_BASE}/wechat_channels/v2/fetch_video_detail"
+                resp = self.session.post(url, json={"share_url": share_url, "raw": False}, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+                username = data.get("data", {}).get("username", "")
+                if username:
+                    logger.info(f"解析到 username: {username[:30]}...")
+                    return username
+            except Exception as e:
+                logger.warning(f"通过 share_url 解析 username 失败: {e}")
+
+        logger.error("无法解析微信视频号 username，请在 config.yaml 中配置 wechat_channels.username")
+        return None
+
+    def _build_share_url(self) -> str:
+        """根据 channel_id 构造分享链接"""
+        cid = self.config.wechat_channel_id
+        if cid and cid.startswith("sph"):
+            short_id = cid[3:]  # 去掉 sph 前缀
+            return f"https://weixin.qq.com/sph/{short_id}"
+        return ""
+
+    def _extract_username_from_nested(self, data: dict) -> str:
+        """在嵌套字典中递归查找 v2_...@finder 格式的 username"""
+        def search(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, str) and v.startswith("v2_") and "@finder" in v:
+                        return v
+                    result = search(v)
+                    if result:
+                        return result
+            elif isinstance(obj, list):
+                for item in obj:
+                    result = search(item)
+                    if result:
+                        return result
+            return None
+        return search(data) or ""
+
+    def get_latest_videos(self) -> list:
+        """获取视频号最新视频列表，支持分页"""
+        username = self.resolve_username()
+        if not username:
+            return []
+
+        url = f"{self.WECHAT_BASE}/wechat_channels/v2/fetch_user_videos"
+        all_videos = []
+        last_buffer = ""
+        max_pages = 5
+
+        for page in range(1, max_pages + 1):
+            try:
+                logger.info(f"获取视频号视频列表 (第{page}页)")
+                payload = {"username": username, "raw": False}
+                if last_buffer:
+                    payload["last_buffer"] = last_buffer
+
+                resp = self.session.post(url, json=payload, timeout=60)
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+
+                videos = data.get("videos", [])
+                if not videos:
+                    logger.warning("视频号响应中无视频数据")
+                    break
+
+                logger.info(f"第{page}页获取到 {len(videos)} 条视频")
+                all_videos.extend(videos)
+
+                last_buffer = data.get("last_buffer", "")
+                up_continue = data.get("up_continue", 0)
+                if not last_buffer or not up_continue:
+                    break
+
+                # 如果已经获取到足够覆盖 lookback 的视频，可以提前停止
+                # 按时间排序后最后一条的时间如果早于 cutoff，则不需要继续翻页
+                oldest_in_page = min(v.get("create_time", 0) for v in videos)
+                cutoff_ts = int(time.time()) - self.config.lookback_hours * 3600
+                if oldest_in_page and oldest_in_page < cutoff_ts and len(all_videos) >= self.config.max_videos:
+                    logger.info("已获取足够覆盖时间窗口的视频，停止翻页")
+                    break
+
+            except Exception as e:
+                logger.error(f"获取视频号视频列表失败: {e}")
+                break
+
+        return self._parse_videos(all_videos)
+
+    def _parse_videos(self, raw_videos: list) -> list:
+        """解析视频号视频数据，统一格式"""
+        parsed = []
+        share_url_base = self._build_share_url()
+
+        for v in raw_videos:
+            try:
+                video_id = str(v.get("id") or "")
+                if not video_id:
+                    continue
+
+                # 标题
+                title_items = v.get("title") or []
+                title = ""
+                if isinstance(title_items, list) and title_items and isinstance(title_items[0], dict):
+                    title = title_items[0].get("shortTitle") or ""
+                title = title.strip() or "无标题"
+
+                create_time = v.get("create_time") or 0
+                media = v.get("media", {})
+                duration = media.get("duration") or 0
+                media_url = media.get("full_url") or media.get("url") or ""
+
+                parsed.append({
+                    "id": video_id,
+                    "title": title,
+                    "create_time": int(create_time) if create_time else 0,
+                    "duration_sec": int(duration),
+                    "share_url": share_url_base,
+                    "media_url": media_url,
+                    "digg_count": v.get("like_count", 0),
+                    "comment_count": v.get("comment_count", 0),
+                    "collect_count": v.get("fav_count", 0),
+                    "platform": "wechat",
+                    "source_nickname": v.get("nickname") or self.config.wechat_nickname,
+                })
+            except Exception as e:
+                logger.warning(f"解析视频号视频数据失败: {e}")
                 continue
-            # 只处理 lookback_hours 时间内的视频
-            if v["create_time"] > 0 and v["create_time"] < cutoff_ts:
-                logger.info(f"  跳过超期: {v['id']} ({date_str}) {v['title'][:30]}")
-                continue
-            logger.info(f"  新视频: {v['id']} ({date_str}) {v['title'][:30]}")
-            new_videos.append(v)
 
-        # 限制每次处理的数量
-        new_videos = new_videos[:self.config.max_videos]
-        logger.info(f"筛选出 {len(new_videos)} 条新视频需要处理")
-        return new_videos
+        # 按创建时间降序排列
+        parsed.sort(key=lambda x: x["create_time"], reverse=True)
+        return parsed
+
+    def filter_new_videos(self, videos: list, state: StateManager) -> list:
+        """筛选出新的、未处理的视频"""
+        return filter_new_videos(videos, self.config, state.is_processed_wechat)
 
 
 # ============================================================
@@ -461,7 +713,7 @@ class VideoProcessor:
             return False
 
     def download_audio(self, video_url: str, video_id: str) -> Optional[str]:
-        """下载视频音频：优先 TikHub 直链，失败再试 yt-dlp"""
+        """下载抖音视频音频：优先 TikHub 直链，失败再试 yt-dlp"""
         audio_path = self.temp_dir / f"{video_id}.mp3"
 
         if audio_path.exists():
@@ -525,6 +777,63 @@ class VideoProcessor:
             return None
         except Exception as e:
             logger.error(f"下载音频失败: {e}")
+            return None
+
+    def download_audio_from_video_url(self, video_url: str, video_id: str) -> Optional[str]:
+        """下载微信视频号视频并提取音频（视频号返回的是完整视频 URL）"""
+        audio_path = self.temp_dir / f"{video_id}.mp3"
+        video_path = self.temp_dir / f"{video_id}.mp4"
+
+        if audio_path.exists():
+            logger.info(f"音频文件已存在: {audio_path}")
+            return str(audio_path)
+
+        if not video_url:
+            logger.error("视频号 media_url 为空，无法下载")
+            return None
+
+        try:
+            logger.info(f"下载视频号视频: {video_url[:80]}...")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://channels.weixin.qq.com/",
+                "Accept": "*/*",
+            }
+            resp = requests.get(video_url, headers=headers, timeout=180, stream=True)
+            resp.raise_for_status()
+
+            total_size = 0
+            with open(video_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        total_size += len(chunk)
+
+            logger.info(f"视频下载完成: {video_path} ({total_size / 1024 / 1024:.2f} MB)")
+
+            # 使用 ffmpeg 提取音频
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-codec:a", "libmp3lame", "-qscale:a", "5", str(audio_path)],
+                capture_output=True, timeout=180
+            )
+
+            # 删除视频文件，保留音频
+            video_path.unlink(missing_ok=True)
+
+            if audio_path.exists() and audio_path.stat().st_size > 1024:
+                logger.info(f"音频提取完成: {audio_path}")
+                return str(audio_path)
+
+            logger.error("音频提取失败或文件为空")
+            return None
+
+        except subprocess.TimeoutExpired:
+            logger.error("视频下载/提取超时")
+            video_path.unlink(missing_ok=True)
+            return None
+        except Exception as e:
+            logger.error(f"下载视频号视频失败: {e}")
+            video_path.unlink(missing_ok=True)
             return None
 
     def transcribe(self, audio_path: str) -> Optional[str]:
@@ -592,7 +901,7 @@ class VideoProcessor:
             if len(transcript) < 50 and video_desc:
                 context = f"转录文本: {transcript}\n视频描述: {video_desc}"
 
-            prompt = f"""你是专业的股市内容分析助手。请将以下抖音视频的转录文本总结为结构化摘要。
+            prompt = f"""你是专业的股市内容分析助手。请将以下抖音/微信视频号视频的转录文本总结为结构化摘要。
 
 请严格按照以下格式输出：
 
@@ -636,8 +945,8 @@ class VideoProcessor:
             return None
 
     def cleanup(self, video_id: str):
-        """清理临时音频文件"""
-        for ext in ['.mp3', '.m4a', '.webm', '.opus']:
+        """清理临时音频/视频文件"""
+        for ext in ['.mp3', '.mp4', '.m4a', '.webm', '.opus']:
             f = self.temp_dir / f"{video_id}{ext}"
             if f.exists():
                 f.unlink()
@@ -723,17 +1032,20 @@ class PushNotifier:
 # ============================================================
 # 消息格式化
 # ============================================================
-def format_message(nickname: str, summaries: list) -> tuple:
+def format_message(main_nickname: str, summaries: list) -> tuple:
     """将多条视频总结格式化为一条推送消息"""
     now_bjt = datetime.now(BJT)
     date_str = now_bjt.strftime('%Y年%m月%d日')
 
-    title = f"{nickname} 今日股市观点 ({date_str})"
+    douyin_count = sum(1 for s in summaries if s["video"].get("platform") == "douyin")
+    wechat_count = sum(1 for s in summaries if s["video"].get("platform") == "wechat")
+
+    title = f"{main_nickname} 今日股市观点 ({date_str})"
 
     parts = [
-        f"## 🎬 {nickname} 今日股市观点",
+        f"## 🎬 {main_nickname} 今日股市观点",
         f"",
-        f"> 📅 {date_str} | 共 {len(summaries)} 条视频更新",
+        f"> 📅 {date_str} | 抖音 {douyin_count} 条 | 视频号 {wechat_count} 条",
         f"> 🤖 AI自动总结，仅供参考",
         f"",
         f"---",
@@ -743,6 +1055,11 @@ def format_message(nickname: str, summaries: list) -> tuple:
     for i, item in enumerate(summaries, 1):
         v = item["video"]
         summary = item["summary"]
+
+        platform = v.get("platform", "douyin")
+        platform_icon = "📱" if platform == "douyin" else "💬"
+        platform_name = "抖音" if platform == "douyin" else "视频号"
+        source_name = v.get("source_nickname", main_nickname)
 
         # 格式化时长
         duration_min = int(v.get("duration_sec", 0) // 60)
@@ -754,7 +1071,7 @@ def format_message(nickname: str, summaries: list) -> tuple:
         comments = v.get("comment_count", 0)
 
         parts.extend([
-            f"### 📹 视频{i}：{v['title'][:50]}",
+            f"### {platform_icon} 视频{i}（{platform_name} · {source_name}）：{v['title'][:50]}",
             f"",
             f"⏱ {duration_str} | 👍 {likes} | 💬 {comments}",
             f"",
@@ -776,79 +1093,114 @@ def format_message(nickname: str, summaries: list) -> tuple:
 
 
 # ============================================================
+# 单条视频处理
+# ============================================================
+def process_single_video(video: dict, processor: VideoProcessor, config: Config, is_wechat: bool = False) -> Optional[dict]:
+    """处理单个视频：下载 -> 转录 -> 总结"""
+    logger.info(f"\n处理视频: {video['title'][:50]} (ID: {video['id']})")
+
+    # 下载音频
+    if is_wechat:
+        audio_path = processor.download_audio_from_video_url(video.get("media_url", ""), video["id"])
+    else:
+        audio_path = processor.download_audio(video["share_url"], video["id"])
+
+    # 语音转文字
+    transcript = None
+    if audio_path:
+        transcript = processor.transcribe(audio_path)
+
+    # 如果标题为空/无标题，尝试用转录文本前30字作为标题
+    if transcript and video.get("title") in ("", "无标题", "视频号更新"):
+        title_from_text = transcript.strip().replace("\n", " ")[:40]
+        if title_from_text:
+            video["title"] = title_from_text
+            logger.info(f"自动生成标题: {title_from_text}")
+
+    # AI总结
+    summary = None
+    if transcript:
+        summary = processor.summarize(video["title"], transcript, video.get("title", ""))
+    else:
+        logger.warning("转录失败，使用视频标题生成简要摘要")
+        if config.llm_api_key:
+            fallback = f"**核心观点**\n视频转录失败，无法获取详细内容。\n\n**视频标题**\n{video['title']}"
+            summary = fallback
+        else:
+            summary = f"视频转录失败。标题: {video['title']}"
+
+    # 清理临时文件
+    processor.cleanup(video["id"])
+
+    if summary:
+        return {"video": video, "summary": summary}
+    return None
+
+
+# ============================================================
 # 主流程
 # ============================================================
 def main():
     logger.info("=" * 60)
-    logger.info("抖音账号视频自动总结 - 开始运行")
+    logger.info("抖音/微信视频号账号视频自动总结 - 开始运行")
     logger.info("=" * 60)
 
     # 1. 加载配置
     config = Config()
-    logger.info(f"监控账号: {config.douyin_nickname} (抖音号: {config.douyin_unique_id})")
+    logger.info(f"抖音监控: {config.douyin_nickname} (抖音号: {config.douyin_unique_id})")
+    if config.wechat_enabled:
+        logger.info(f"视频号监控: {config.wechat_nickname} (channel_id: {config.wechat_channel_id})")
+    else:
+        logger.info("微信视频号监控: 已禁用")
 
     # 2. 初始化组件
     state = StateManager(config.state_file)
-    monitor = DouyinMonitor(config)
     processor = VideoProcessor(config)
     notifier = PushNotifier(config)
 
-    # 3. 获取最新视频
-    videos = monitor.get_latest_videos()
-    if not videos:
-        logger.warning("未获取到任何视频，程序结束")
-        return
+    all_summaries = []
 
-    # 4. 筛选新视频
-    new_videos = monitor.filter_new_videos(videos, state)
-    if not new_videos:
-        logger.info("没有新视频需要处理，程序结束")
-        return
+    # 3. 处理抖音视频
+    logger.info("\n" + "-" * 60)
+    logger.info("【抖音】开始获取最新视频")
+    logger.info("-" * 60)
+    douyin_monitor = DouyinMonitor(config)
+    douyin_videos = douyin_monitor.get_latest_videos()
+    if douyin_videos:
+        douyin_new = douyin_monitor.filter_new_videos(douyin_videos, state)
+        for video in douyin_new:
+            result = process_single_video(video, processor, config, is_wechat=False)
+            if result:
+                all_summaries.append(result)
+            state.mark_processed(video["id"], video["create_time"])
+            time.sleep(2)
+    else:
+        logger.warning("未获取到抖音视频")
 
-    # 5. 逐个处理视频
-    summaries = []
-    for video in new_videos:
-        logger.info(f"\n处理视频: {video['title'][:50]} (ID: {video['id']})")
-
-        # 5.1 下载音频
-        audio_path = processor.download_audio(video["share_url"], video["id"])
-
-        # 5.2 语音转文字
-        transcript = None
-        if audio_path:
-            transcript = processor.transcribe(audio_path)
-
-        # 5.3 AI总结
-        summary = None
-        if transcript:
-            summary = processor.summarize(video["title"], transcript, video.get("title", ""))
+    # 4. 处理微信视频号视频
+    if config.wechat_enabled:
+        logger.info("\n" + "-" * 60)
+        logger.info("【微信视频号】开始获取最新视频")
+        logger.info("-" * 60)
+        wechat_monitor = WeChatChannelsMonitor(config)
+        wechat_videos = wechat_monitor.get_latest_videos()
+        if wechat_videos:
+            wechat_new = wechat_monitor.filter_new_videos(wechat_videos, state)
+            for video in wechat_new:
+                result = process_single_video(video, processor, config, is_wechat=True)
+                if result:
+                    all_summaries.append(result)
+                state.mark_processed_wechat(video["id"], video["create_time"])
+                time.sleep(2)
         else:
-            # 转录失败，尝试仅用标题做简要总结
-            logger.warning("转录失败，使用视频标题生成简要摘要")
-            if config.llm_api_key:
-                fallback = f"**核心观点**\n视频转录失败，无法获取详细内容。\n\n**视频标题**\n{video['title']}"
-                summary = fallback
-            else:
-                summary = f"视频转录失败。标题: {video['title']}"
+            logger.warning("未获取到视频号视频")
 
-        if summary:
-            summaries.append({
-                "video": video,
-                "summary": summary
-            })
-
-        # 5.4 清理临时文件
-        processor.cleanup(video["id"])
-
-        # 5.5 标记为已处理
-        state.mark_processed(video["id"], video["create_time"])
-
-        # 避免请求过快
-        time.sleep(2)
+    # 5. 按创建时间排序（合并后保持时间顺序）
+    all_summaries.sort(key=lambda x: x["video"]["create_time"], reverse=True)
 
     # 6. 推送通知
-    if summaries:
-        title, content = format_message(config.douyin_nickname, summaries)
+    if all_summaries:
+        title, content = format_message(config.douyin_nickname, all_summaries)
         logger.info(f"准备推送: {title}")
         success = notifier.push(title, content)
 
