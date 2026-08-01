@@ -1,0 +1,51 @@
+name: Daily Douyin Stock Summary
+
+# 每天 20:00 北京时间（12:00 UTC）自动运行
+on:
+  schedule:
+    - cron: '0 12 * * *'        # 12:00 UTC = 20:00 北京时间
+  workflow_dispatch:             # 允许手动触发
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run summary script
+        env:
+          DOUYIN_UNIQUE_ID: ${{ secrets.DOUYIN_UNIQUE_ID }}
+          DOUYIN_NICKNAME: ${{ secrets.DOUYIN_NICKNAME }}
+          TIKHUB_API_KEY: ${{ secrets.TIKHUB_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          PUSH_METHOD: ${{ secrets.PUSH_METHOD }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+        run: python main.py
+
+      - name: Commit state file
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update processed video state"
+          file_pattern: state.json
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
