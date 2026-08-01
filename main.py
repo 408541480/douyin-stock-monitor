@@ -14,12 +14,14 @@ import sys
 import json
 import time
 import yaml
+import shutil
+import struct
 import logging
 import requests
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 
 # ============================================================
 # 日志配置
@@ -516,6 +518,21 @@ class WeChatChannelsMonitor:
             return None
         return search(data) or ""
 
+    def _save_debug_response(self, data, tag: str = ""):
+        """将 API 响应数据保存到文件，便于离线分析"""
+        try:
+            debug_path = Path(__file__).parent / "debug_wechat_response.json"
+            debug_entry = {
+                "tag": tag,
+                "timestamp": datetime.now(BJT).isoformat(),
+                "data": data
+            }
+            with open(debug_path, 'w', encoding='utf-8') as f:
+                json.dump(debug_entry, f, ensure_ascii=False, indent=2, default=str)
+            logger.info(f"调试响应已保存: {debug_path} (tag={tag})")
+        except Exception as e:
+            logger.warning(f"保存调试响应失败: {e}")
+
     def get_latest_videos(self) -> list:
         """获取视频号最新视频列表，支持分页"""
         username = self.resolve_username()
@@ -544,6 +561,11 @@ class WeChatChannelsMonitor:
                     break
 
                 logger.info(f"第{page}页获取到 {len(videos)} 条视频")
+
+                # 第一页时保存调试信息：完整响应结构
+                if page == 1 and videos:
+                    self._save_debug_response(videos[0], "fetch_user_videos_first_video")
+
                 all_videos.extend(videos)
 
                 last_buffer = data.get("last_buffer", "")
@@ -623,7 +645,161 @@ class WeChatChannelsMonitor:
 
 
 # ============================================================
-# 视频处理器（下载 -> 转录 -> 总结）
+# Isaac64 PRNG（微信视频号视频解密用）
+# ============================================================
+class Isaac64:
+    """
+    Isaac64 伪随机数生成器，用于微信视频号视频解密。
+    算法移植自 https://github.com/ltaoo/wx_channels_download/blob/main/pkg/decrypt/decrypt.go
+    """
+
+    MASK64 = 0xFFFFFFFFFFFFFFFF
+    GOLDEN = 0x9e3779b97f4a7c13
+    ENCRYPT_LEN = 131072  # 128 KB，仅前 128KB 被加密
+
+    def __init__(self, seed: int):
+        self.rand_cnt = 255
+        self.aa = 0
+        self.bb = 0
+        self.cc = 0
+        self.seed = [0] * 256
+        self.mm = [0] * 256
+        self._init(seed)
+
+    def _mix(self, vals):
+        """混合函数，vals 是 [a,b,c,d,e,f,g,h] 列表，原地修改"""
+        a, b, c, d, e, f, g, h = vals
+        a = (a - e) & self.MASK64
+        f ^= (h >> 9)
+        h = (h + a) & self.MASK64
+        b = (b - f) & self.MASK64
+        g ^= (a << 9) & self.MASK64
+        a = (a + b) & self.MASK64
+        c = (c - g) & self.MASK64
+        h ^= (b >> 23)
+        b = (b + c) & self.MASK64
+        d = (d - h) & self.MASK64
+        a ^= (c << 15) & self.MASK64
+        c = (c + d) & self.MASK64
+        e = (e - a) & self.MASK64
+        b ^= (d >> 14)
+        d = (d + e) & self.MASK64
+        f = (f - b) & self.MASK64
+        c ^= (e << 20) & self.MASK64
+        e = (e + f) & self.MASK64
+        g = (g - c) & self.MASK64
+        d ^= (f >> 17)
+        f = (f + g) & self.MASK64
+        h = (h - d) & self.MASK64
+        e ^= (g << 14) & self.MASK64
+        g = (g + h) & self.MASK64
+        return [a, b, c, d, e, f, g, h]
+
+    def _init(self, enc_key: int):
+        """初始化 ISAAC64 状态"""
+        enc_key &= self.MASK64
+        g = self.GOLDEN
+        vals = [g] * 8  # a=b=c=d=e=f=g=h=golden
+
+        self.seed[0] = enc_key
+        for i in range(1, 256):
+            self.seed[i] = 0
+
+        for _ in range(4):
+            vals = self._mix(vals)
+
+        # 第一遍：用 Seed 初始化 MM
+        for i in range(0, 256, 8):
+            vals[0] = (vals[0] + self.seed[i]) & self.MASK64
+            vals[1] = (vals[1] + self.seed[i + 1]) & self.MASK64
+            vals[2] = (vals[2] + self.seed[i + 2]) & self.MASK64
+            vals[3] = (vals[3] + self.seed[i + 3]) & self.MASK64
+            vals[4] = (vals[4] + self.seed[i + 4]) & self.MASK64
+            vals[5] = (vals[5] + self.seed[i + 5]) & self.MASK64
+            vals[6] = (vals[6] + self.seed[i + 6]) & self.MASK64
+            vals[7] = (vals[7] + self.seed[i + 7]) & self.MASK64
+            vals = self._mix(vals)
+            self.mm[i] = vals[0]
+            self.mm[i + 1] = vals[1]
+            self.mm[i + 2] = vals[2]
+            self.mm[i + 3] = vals[3]
+            self.mm[i + 4] = vals[4]
+            self.mm[i + 5] = vals[5]
+            self.mm[i + 6] = vals[6]
+            self.mm[i + 7] = vals[7]
+
+        # 第二遍：用 MM 再次混合
+        for i in range(0, 256, 8):
+            vals[0] = (vals[0] + self.mm[i]) & self.MASK64
+            vals[1] = (vals[1] + self.mm[i + 1]) & self.MASK64
+            vals[2] = (vals[2] + self.mm[i + 2]) & self.MASK64
+            vals[3] = (vals[3] + self.mm[i + 3]) & self.MASK64
+            vals[4] = (vals[4] + self.mm[i + 4]) & self.MASK64
+            vals[5] = (vals[5] + self.mm[i + 5]) & self.MASK64
+            vals[6] = (vals[6] + self.mm[i + 6]) & self.MASK64
+            vals[7] = (vals[7] + self.mm[i + 7]) & self.MASK64
+            vals = self._mix(vals)
+            self.mm[i] = vals[0]
+            self.mm[i + 1] = vals[1]
+            self.mm[i + 2] = vals[2]
+            self.mm[i + 3] = vals[3]
+            self.mm[i + 4] = vals[4]
+            self.mm[i + 5] = vals[5]
+            self.mm[i + 6] = vals[6]
+            self.mm[i + 7] = vals[7]
+
+        self._isaac64()
+
+    def _isaac64(self):
+        """生成一批 256 个随机数"""
+        self.cc = (self.cc + 1) & self.MASK64
+        self.bb = (self.bb + self.cc) & self.MASK64
+
+        for i in range(256):
+            remainder = i % 4
+            if remainder == 0:
+                self.aa = (self.aa ^ ((self.aa << 21) & self.MASK64)) ^ self.MASK64
+            elif remainder == 1:
+                self.aa ^= (self.aa >> 5)
+            elif remainder == 2:
+                self.aa ^= (self.aa << 12) & self.MASK64
+            else:
+                self.aa ^= (self.aa >> 33)
+
+            self.aa = (self.aa + self.mm[(i + 128) % 256]) & self.MASK64
+            x = self.mm[i]
+            y = (self.mm[(x >> 3) % 256] + self.aa + self.bb) & self.MASK64
+            self.mm[i] = y
+            self.bb = (self.mm[(y >> 11) % 256] + x) & self.MASK64
+            self.seed[i] = self.bb
+
+    def random(self) -> int:
+        """返回一个 64 位随机数"""
+        result = self.seed[self.rand_cnt]
+        if self.rand_cnt == 0:
+            self._isaac64()
+            self.rand_cnt = 255
+        else:
+            self.rand_cnt -= 1
+        return result
+
+    def generate_keystream(self, length: int = 131072) -> bytes:
+        """生成指定长度的密钥流（BigEndian 字节序列）"""
+        result = bytearray(length)
+        offset = 0
+        while offset < length:
+            rand_val = self.random()
+            chunk = struct.pack('>Q', rand_val)  # BigEndian uint64
+            for b in chunk:
+                if offset >= length:
+                    break
+                result[offset] = b
+                offset += 1
+        return bytes(result)
+
+
+# ============================================================
+# 视频处理器（下载 -> 解密 -> 转录 -> 总结）
 # ============================================================
 class VideoProcessor:
     """下载视频音频、语音转文字、AI总结"""
@@ -861,102 +1037,131 @@ class VideoProcessor:
             logger.warning(f"ffprobe 异常: {e}")
             return True  # 不阻止后续尝试
 
-    def _get_wechat_playable_url(self, video_id: str, username: str, share_url: str) -> Optional[str]:
+    def _get_wechat_video_url_and_key(self, video_id: str, username: str = "",
+                                       share_url: str = "") -> Optional[tuple]:
         """
-        通过 TikHub fetch_video_detail 接口获取可播放的视频 URL。
-        尝试 raw=False 和 raw=True 两种模式，并记录完整响应结构用于调试。
+        通过 TikHub fetch_video_detail 获取视频下载 URL 和 decode_key。
+        微信视频号视频是加密的：前 128KB 被 XOR 加密，需要 decode_key 解密。
+
+        参数优先级：object_id > share_url
+        返回 (full_url, decode_key) 元组，失败返回 None。
         """
         if not self._wechat_session:
             return None
 
-        # 尝试多种参数组合（包括 raw=True 获取原始响应）
+        # 按优先级构建请求参数
         payloads = []
+        # 优先使用 object_id（即 video_id，来自 fetch_user_videos 的 id 字段）
+        if video_id:
+            payloads.append({"object_id": video_id, "raw": False})
+        # 其次使用 share_url
         if share_url:
             payloads.append({"share_url": share_url, "raw": False})
-            payloads.append({"share_url": share_url, "raw": True})
-        if username and video_id:
-            payloads.append({"username": username, "video_id": video_id, "raw": False})
-            payloads.append({"username": username, "video_id": video_id, "raw": True})
 
         for payload in payloads:
             try:
-                raw_flag = payload.get("raw", False)
-                logger.info(f"调用 fetch_video_detail: params={list(payload.keys())}, raw={raw_flag}")
+                logger.info(f"调用 fetch_video_detail: params={list(payload.keys())}")
                 url = f"{self.WECHAT_API_BASE}/wechat_channels/v2/fetch_video_detail"
                 resp = self._wechat_session.post(url, json=payload, timeout=30)
                 resp.raise_for_status()
                 data = resp.json().get("data", {})
 
-                # 记录响应的顶层键和所有 URL-like 字符串
-                self._log_wechat_response_structure(data, prefix="fetch_video_detail")
+                # raw=False 模式: data.media 是一个对象，包含 full_url 和 decode_key
+                media = data.get("media", {})
+                if isinstance(media, dict):
+                    full_url = media.get("full_url") or ""
+                    decode_key = media.get("decode_key") or ""
 
-                # 在响应中递归搜索 URL 字段，排除 encfilekey 加密 URL
-                playable_url = self._find_playable_url(data)
-                if playable_url:
-                    logger.info(f"fetch_video_detail 返回可播放URL: {playable_url[:80]}...")
-                    return playable_url
+                    if full_url:
+                        logger.info(f"fetch_video_detail 返回: full_url={full_url[:80]}..., decode_key={decode_key}")
+                        return (full_url, decode_key)
 
-                logger.warning(f"fetch_video_detail 响应中未找到可播放URL (raw={raw_flag})")
+                # 如果 raw=False 没找到，尝试从 raw=True 模式的嵌套结构中提取
+                logger.warning("raw=False 模式未找到 media.full_url，尝试 raw=True")
+                payload["raw"] = True
+                resp = self._wechat_session.post(url, json=payload, timeout=30)
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+
+                # raw=True 模式: data.objects[0].objectDesc.media[0] 包含 url, urlToken, decodeKey
+                objects = data.get("objects", [])
+                if objects:
+                    obj_desc = objects[0].get("objectDesc", {})
+                    media_list = obj_desc.get("media", [])
+                    if media_list and isinstance(media_list, list):
+                        m = media_list[0]
+                        raw_url = m.get("url", "")
+                        url_token = m.get("urlToken", "")
+                        decode_key = m.get("decodeKey", "")
+                        full_url = raw_url + url_token if raw_url else ""
+                        if full_url:
+                            logger.info(f"raw=True 模式找到: url={raw_url[:60]}..., decode_key={decode_key}")
+                            return (full_url, decode_key)
+
+                logger.warning(f"fetch_video_detail 未返回有效的 URL+key (params={list(payload.keys())})")
             except Exception as e:
-                logger.warning(f"fetch_video_detail 调用失败 (params={list(payload.keys())}): {e}")
+                logger.warning(f"fetch_video_detail 调用失败: {e}")
 
         return None
 
-    def _log_wechat_response_structure(self, data, prefix="", depth=0):
-        """记录微信API响应的结构（键名和URL-like字符串），用于调试"""
-        if depth > 5:
-            return
-        indent = "  " * depth
+    def _decrypt_wechat_video(self, video_path: Path, decode_key: str) -> bool:
+        """
+        解密微信视频号加密视频。
+        仅前 128KB 被 XOR 加密，使用 Isaac64 PRNG 生成密钥流。
 
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, str) and len(value) > 30:
-                    # 记录长字符串（可能是URL）
-                    has_enc = "encfilekey" in value.lower()
-                    is_url = value.startswith("http")
-                    if is_url:
-                        logger.info(f"{prefix} [{indent}{key}] URL(enc={has_enc}): {value[:100]}...")
-                    elif not has_enc and len(value) < 200:
-                        logger.info(f"{prefix} [{indent}{key}] = {value[:100]}")
-                elif isinstance(value, (dict, list)):
-                    logger.info(f"{prefix} [{indent}{key}]: {type(value).__name__}({len(value)})")
-                    self._log_wechat_response_structure(value, prefix, depth + 1)
-                elif value is not None and not isinstance(value, bool):
-                    logger.info(f"{prefix} [{indent}{key}] = {value}")
-        elif isinstance(data, list) and len(data) > 0:
-            # 只检查第一个元素
-            self._log_wechat_response_structure(data[0], prefix, depth + 1)
+        Args:
+            video_path: 加密视频文件路径（原地解密）
+            decode_key: 解密密钥（数字字符串，如 "2136343393"）
 
-    def _find_playable_url(self, data, depth=0) -> Optional[str]:
-        """在嵌套字典/列表中递归查找可播放的视频 URL（排除 encfilekey 加密 URL）"""
-        if depth > 10:
-            return None
+        Returns:
+            True 表示解密成功，False 表示失败或无需解密
+        """
+        if not decode_key or decode_key == "0":
+            logger.info("decode_key 为空或0，视频未加密，无需解密")
+            return True
 
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, str) and len(value) > 20:
-                    lower = value.lower()
-                    # 排除 encfilekey 加密 URL
-                    if "encfilekey" in lower:
-                        continue
-                    # 匹配视频 URL 模式
-                    if any(domain in lower for domain in ["tc.qq.com", "mpvideo.qpic.cn", "wxapp"]) \
-                            and value.startswith("http"):
-                        return value
-                    # 匹配其他可能的视频 URL
-                    if key.lower() in ("url", "full_url", "play_url", "mp4_url", "video_url", "download_url") \
-                            and value.startswith("http") and "encfilekey" not in lower:
-                        return value
-                elif isinstance(value, (dict, list)):
-                    result = self._find_playable_url(value, depth + 1)
-                    if result:
-                        return result
-        elif isinstance(data, list):
-            for item in data:
-                result = self._find_playable_url(item, depth + 1)
-                if result:
-                    return result
-        return None
+        try:
+            key_int = int(decode_key)
+        except (ValueError, TypeError):
+            logger.error(f"decode_key 无法转换为整数: {decode_key}")
+            return False
+
+        if key_int == 0:
+            logger.info("decode_key=0，视频未加密")
+            return True
+
+        try:
+            # 读取加密视频文件
+            with open(video_path, 'rb') as f:
+                data = bytearray(f.read())
+
+            enc_len = min(Isaac64.ENCRYPT_LEN, len(data))
+            logger.info(f"开始解密视频: {video_path.name}, 加密长度={enc_len}, decode_key={decode_key}")
+
+            # 生成密钥流并 XOR 解密
+            isaac = Isaac64(key_int)
+            keystream = isaac.generate_keystream(enc_len)
+
+            for i in range(enc_len):
+                data[i] ^= keystream[i]
+
+            # 验证解密结果：检查 MP4 ftyp 签名
+            if len(data) >= 8 and b'ftyp' in bytes(data[4:12]):
+                logger.info("解密成功！检测到 MP4 ftyp 签名")
+            else:
+                logger.warning(f"解密后未检测到 ftyp 签名，前12字节: {bytes(data[:12]).hex()}")
+                # 仍然写入，可能是其他格式
+
+            # 写回解密后的文件
+            with open(video_path, 'wb') as f:
+                f.write(data)
+
+            logger.info(f"视频解密完成: {video_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"视频解密失败: {e}")
+            return False
 
     def _download_video_file(self, video_url: str, video_path: Path) -> Optional[int]:
         """
@@ -1006,10 +1211,16 @@ class VideoProcessor:
                                        username: str = "", share_url: str = "") -> Optional[str]:
         """
         下载微信视频号视频并提取音频。
-        流程：直接URL → (失败时) fetch_video_detail获取新URL → 音频提取 → Whisper直传。
+        完整流程：
+        1. 通过 fetch_video_detail 获取 full_url + decode_key
+        2. 下载加密视频
+        3. 用 decode_key 解密（Isaac64 XOR，前128KB）
+        4. 提取音频
+        5. 失败则直接传视频给 Whisper
         """
         audio_path = self.temp_dir / f"{video_id}.mp3"
         video_path = self.temp_dir / f"{video_id}.mp4"
+        decrypted_path = self.temp_dir / f"{video_id}_dec.mp4"
 
         # 检查是否已有缓存的音频文件（可能是任意格式）
         for ext in ['.mp3', '.m4a', '.wav']:
@@ -1018,87 +1229,97 @@ class VideoProcessor:
                 logger.info(f"音频文件已存在: {existing}")
                 return str(existing)
 
-        if not video_url:
-            logger.error("视频号 media_url 为空，无法下载")
-            return None
+        # 步骤1：通过 fetch_video_detail 获取 full_url + decode_key
+        logger.info(f"通过 fetch_video_detail 获取视频URL和解密密钥 (video_id={video_id})")
+        url_and_key = self._get_wechat_video_url_and_key(video_id, username, share_url)
 
-        # 收集所有可能的 URL 来源
-        urls_to_try = [video_url]
+        if url_and_key:
+            fetch_url, decode_key = url_and_key
+            logger.info(f"获取到: URL={fetch_url[:80]}..., decode_key={decode_key}")
 
-        # 如果第一个 URL 包含 encfilekey（加密URL），提前获取 fallback
-        if "encfilekey" in video_url.lower():
-            logger.warning("视频URL包含encfilekey（加密URL），尝试通过fetch_video_detail获取可播放URL")
-            playable = self._get_wechat_playable_url(video_id, username, share_url)
-            if playable and playable != video_url:
-                urls_to_try.append(playable)
-
-        for current_url in urls_to_try:
-            # 下载视频
-            file_size = self._download_video_file(current_url, video_path)
-            if not file_size:
-                continue
-
-            # 检查是否为有效的视频文件（检查 magic bytes）
-            with open(video_path, 'rb') as f:
-                magic = f.read(12)
-
-            is_valid_video = (
-                len(magic) >= 8 and (
-                    b'ftyp' in magic or           # MP4/MOV
-                    b'\x1a\x45\xdf\xa3' in magic[:4] or  # MKV/WebM
-                    b'FLV' in magic[:3] or         # FLV
-                    b'\x00\x00\x01' in magic[:4]   # MPEG-TS
-                )
-            )
-
-            if not is_valid_video:
-                with open(video_path, 'rb') as f:
-                    head = f.read(200)
-                logger.warning(f"URL返回的不是有效视频格式 (URL: {current_url[:60]}...)，前20字节hex: {head[:20].hex()}")
-                video_path.unlink(missing_ok=True)
-
-                # 如果还有其他URL可试，继续
-                if current_url != urls_to_try[-1]:
-                    continue
-
-                # 所有URL都失败了，最后尝试一次 fetch_video_detail（如果还没试过）
-                if len(urls_to_try) == 1:
-                    logger.info("所有直接URL失败，尝试通过fetch_video_detail获取可播放URL")
-                    playable = self._get_wechat_playable_url(video_id, username, share_url)
-                    if playable and playable not in urls_to_try:
-                        file_size = self._download_video_file(playable, video_path)
-                        if file_size:
-                            with open(video_path, 'rb') as f:
-                                magic = f.read(12)
-                            if b'ftyp' in magic or b'\x1a\x45\xdf\xa3' in magic[:4] or b'FLV' in magic[:3]:
-                                is_valid_video = True
-                            else:
+            # 步骤2：下载加密视频
+            file_size = self._download_video_file(fetch_url, video_path)
+            if file_size:
+                # 步骤3：解密视频
+                if decode_key and decode_key != "0":
+                    logger.info(f"视频需要解密 (decode_key={decode_key})")
+                    # 复制到解密路径，原地解密
+                    shutil.copy2(video_path, decrypted_path)
+                    if self._decrypt_wechat_video(decrypted_path, decode_key):
+                        # 验证解密后的视频
+                        with open(decrypted_path, 'rb') as f:
+                            magic = f.read(12)
+                        if b'ftyp' in magic:
+                            logger.info("解密后视频验证成功 (MP4 ftyp)")
+                            # 用解密后的文件提取音频
+                            self._probe_video(decrypted_path)
+                            audio_result = self._run_ffmpeg_extract(decrypted_path, audio_path)
+                            if audio_result:
                                 video_path.unlink(missing_ok=True)
+                                decrypted_path.unlink(missing_ok=True)
+                                return audio_result
+                            # 音频提取失败，尝试直接传视频给 Whisper
+                            if decrypted_path.exists() and decrypted_path.stat().st_size > 10240:
+                                logger.warning("音频提取失败，使用解密后的视频文件直接转录")
+                                result_path = str(decrypted_path)
+                                video_path.unlink(missing_ok=True)
+                                return result_path
+                        else:
+                            logger.warning(f"解密后视频验证失败，前12字节: {magic[:12].hex()}")
+                    else:
+                        logger.error("视频解密失败")
+                else:
+                    logger.info("视频无需解密 (decode_key 为空或0)")
+                    # 直接尝试提取音频
+                    self._probe_video(video_path)
+                    audio_result = self._run_ffmpeg_extract(video_path, audio_path)
+                    if audio_result:
+                        video_path.unlink(missing_ok=True)
+                        return audio_result
+                    if video_path.exists() and video_path.stat().st_size > 10240:
+                        logger.warning("音频提取失败，使用视频文件直接转录")
+                        return str(video_path)
 
-                if not is_valid_video:
-                    logger.error("无法获取可播放的视频文件")
-                    return None
+                # 清理解密文件
+                decrypted_path.unlink(missing_ok=True)
+        else:
+            logger.warning("fetch_video_detail 未返回 URL+key，尝试使用原始 media_url")
 
-            # 到这里说明视频文件是有效的
-            # 用 ffprobe 检查音频流
-            self._probe_video(video_path)
+        # 回退方案：尝试直接使用 fetch_user_videos 返回的 media_url
+        if video_url:
+            logger.info(f"尝试直接下载 media_url: {video_url[:80]}...")
+            file_size = self._download_video_file(video_url, video_path)
+            if file_size:
+                # 检查是否为有效视频
+                with open(video_path, 'rb') as f:
+                    magic = f.read(12)
+                is_valid = (
+                    len(magic) >= 8 and (
+                        b'ftyp' in magic or
+                        b'\x1a\x45\xdf\xa3' in magic[:4] or
+                        b'FLV' in magic[:3] or
+                        b'\x00\x00\x01' in magic[:4]
+                    )
+                )
+                if is_valid:
+                    logger.info("media_url 下载的视频有效，提取音频")
+                    self._probe_video(video_path)
+                    audio_result = self._run_ffmpeg_extract(video_path, audio_path)
+                    if audio_result:
+                        video_path.unlink(missing_ok=True)
+                        return audio_result
+                    if video_path.exists() and video_path.stat().st_size > 10240:
+                        logger.warning("音频提取失败，使用视频文件直接转录")
+                        return str(video_path)
+                else:
+                    logger.warning(f"media_url 下载的不是有效视频，前12字节: {magic[:12].hex()}")
+                    video_path.unlink(missing_ok=True)
 
-            # 尝试提取音频
-            audio_result = self._run_ffmpeg_extract(video_path, audio_path)
-
-            if audio_result:
-                video_path.unlink(missing_ok=True)
-                return audio_result
-
-            # 音频提取失败 —— 尝试直接传视频文件给 Whisper
-            logger.warning("音频提取全部失败，尝试直接使用视频文件进行转录")
-            if video_path.exists() and video_path.stat().st_size > 10240:
-                logger.info(f"使用视频文件直接转录: {video_path}")
-                return str(video_path)
-
-            logger.error("视频文件不可用，无法转录")
-            video_path.unlink(missing_ok=True)
-            return None
+        # 清理临时文件
+        video_path.unlink(missing_ok=True)
+        decrypted_path.unlink(missing_ok=True)
+        logger.error("微信视频号视频下载和解密全部失败")
+        return None
 
     def transcribe(self, audio_path: str) -> Optional[str]:
         """使用 faster-whisper 语音转文字"""
@@ -1215,6 +1436,11 @@ class VideoProcessor:
             if f.exists():
                 f.unlink()
                 logger.info(f"已清理临时文件: {f}")
+        # 清理解密后的视频文件
+        dec_f = self.temp_dir / f"{video_id}_dec.mp4"
+        if dec_f.exists():
+            dec_f.unlink()
+            logger.info(f"已清理临时文件: {dec_f}")
 
 
 # ============================================================
