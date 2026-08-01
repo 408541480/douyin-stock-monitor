@@ -10,7 +10,15 @@ douyin:
   sec_uid: "MS4wLjABAAAAf0C1gFEdMvoFGiiMUZbYQeLVpezDCv4fyNjWk9W2myE"  # 已验证，预填可省一次API调用
   nickname: "真如铁"                # 昵称（用于推送消息标题）
 
-# TikHub API 配置（用于获取抖音用户视频列表）
+# 微信视频号配置（用于获取视频号视频）
+# 注意：视频号 API 需要 TikHub 付费余额（不支持免费额度）
+wechat_channels:
+  enabled: true                     # 是否同时监控微信视频号
+  channel_id: "sphAdqjvDpQ0D"      # 视频号分享链接中的ID（weixin.qq.com/sph/后面的部分，前面加上 sph）
+  username: "v2_060000231003b20faec8cae7801fc6d6c705ed3cb077234a77da602d1dc993b891e39a8e6ec5@finder"  # finder username（v2_...@finder 格式），可留空由程序自动解析
+  nickname: "笑傲江湖真如铁"        # 视频号昵称（用于推送消息标题）
+
+# TikHub API 配置（用于获取抖音用户视频列表、微信视频号视频）
 # 注册地址: https://user.tikhub.io
 # 新用户有免费额度，按量计费约 $0.01/次
 tikhub:
