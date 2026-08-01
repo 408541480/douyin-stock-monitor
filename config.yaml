@@ -4,8 +4,9 @@
 # 本地运行时使用此文件配置
 # GitHub Actions 运行时通过 Secrets 环境变量覆盖
 
-# 抖音账号配置
+# 抖音账号配置（已禁用 - 抖音 TikHub API 不稳定）
 douyin:
+  enabled: false                    # 是否监控抖音
   unique_id: "zhenrutie001"       # 抖音号（用户提供的）
   sec_uid: "MS4wLjABAAAAf0C1gFEdMvoFGiiMUZbYQeLVpezDCv4fyNjWk9W2myE"  # 已验证，预填可省一次API调用
   nickname: "真如铁"                # 昵称（用于推送消息标题）
