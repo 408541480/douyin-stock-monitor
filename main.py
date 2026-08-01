@@ -362,15 +362,99 @@ class VideoProcessor:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self._whisper_model = None
 
+        # 用于从 TikHub 获取直链的会话
+        self._tikhub_session = None
+        if config.tikhub_api_key and config.tikhub_base_url:
+            self._tikhub_session = requests.Session()
+            self._tikhub_session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {config.tikhub_api_key}",
+            })
+
+    def _get_audio_url_from_tikhub(self, video_id: str) -> Optional[str]:
+        """通过 TikHub fetch_one_video 获取无 Cookie 音频直链"""
+        if not self._tikhub_session:
+            return None
+        try:
+            endpoint = f"{self.config.tikhub_base_url}/douyin/web/fetch_one_video"
+            resp = self._tikhub_session.get(endpoint, params={"aweme_id": video_id}, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            aweme = data.get("data", {}).get("aweme_detail", {})
+            # 优先取独立音频流（无视频画面，更小）
+            bit_rate_audio = aweme.get("video", {}).get("bit_rate_audio") or []
+            if bit_rate_audio:
+                url_list = bit_rate_audio[0].get("audio_meta", {}).get("url_list", {})
+                for key in ("main_url", "backup_url", "fallback_url"):
+                    url = url_list.get(key)
+                    if url:
+                        return url
+
+            # 回退到视频播放地址，再让 ffmpeg 提取音频
+            play_addr = aweme.get("video", {}).get("play_addr", {})
+            for url in play_addr.get("url_list", []):
+                if url:
+                    return url
+
+            return None
+        except Exception as e:
+            logger.warning(f"TikHub 获取音频直链失败: {e}")
+            return None
+
+    def _download_audio_direct(self, audio_url: str, output_path: Path) -> bool:
+        """使用 requests 直接下载音频/视频文件"""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.douyin.com/",
+            }
+            resp = requests.get(audio_url, headers=headers, timeout=120, stream=True)
+            resp.raise_for_status()
+
+            raw_path = output_path.with_suffix('.mp4')
+            with open(raw_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            # 转换为 mp3
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(raw_path), "-vn", "-codec:a", "libmp3lame", "-qscale:a", "5", str(output_path)],
+                capture_output=True, timeout=120
+            )
+            raw_path.unlink(missing_ok=True)
+
+            if output_path.exists() and output_path.stat().st_size > 1024:
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"直接下载音频失败: {e}")
+            return False
+
     def download_audio(self, video_url: str, video_id: str) -> Optional[str]:
-        """使用 yt-dlp 下载视频音频"""
+        """下载视频音频：优先 TikHub 直链，失败再试 yt-dlp"""
         audio_path = self.temp_dir / f"{video_id}.mp3"
 
         if audio_path.exists():
             logger.info(f"音频文件已存在: {audio_path}")
             return str(audio_path)
 
-        logger.info(f"下载音频: {video_url}")
+        # 方案1：TikHub 直链（无需 Cookie，成功率更高）
+        logger.info(f"尝试从 TikHub 获取音频直链 (video_id={video_id})")
+        audio_url = self._get_audio_url_from_tikhub(video_id)
+        if audio_url:
+            logger.info(f"获取到直链，开始下载: {audio_url[:80]}...")
+            if self._download_audio_direct(audio_url, audio_path):
+                logger.info(f"音频下载完成: {audio_path}")
+                return str(audio_path)
+            logger.warning("TikHub 直链下载失败，尝试 yt-dlp")
+        else:
+            logger.warning("未获取到 TikHub 直链，尝试 yt-dlp")
+
+        # 方案2：yt-dlp 回退
+        logger.info(f"使用 yt-dlp 下载: {video_url}")
         cmd = [
             "yt-dlp",
             "-x",                         # 仅提取音频
