@@ -8,3 +8,7 @@ venv/
 *.wav
 downloads/
 _openapi.json
+_logs/
+workflow_logs.zip
+debug_wechat_response.json
+temp/
