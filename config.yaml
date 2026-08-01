@@ -48,7 +48,7 @@ push:
 
 # 运行配置
 runtime:
-  lookback_hours: 240              # 临时：10天，覆盖最近未处理的视频
-  max_videos_per_run: 3            # 临时：处理最近3条
+  lookback_hours: 24               # 向前查看24小时的视频
+  max_videos_per_run: 10           # 每次最多处理10条视频
   temp_dir: "./temp"               # 临时文件目录
   state_file: "state.json"         # 状态文件（记录已处理的视频）
