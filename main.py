@@ -682,8 +682,8 @@ class VideoProcessor:
 
         return None
 
-    def _download_audio_direct(self, audio_url: str, output_path: Path) -> bool:
-        """使用 requests 直接下载音频/视频文件"""
+    def _download_audio_direct(self, audio_url: str, output_path: Path) -> Optional[str]:
+        """使用 requests 直接下载音频/视频文件，然后提取音频。返回音频文件路径，失败返回 None"""
         try:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -698,36 +698,35 @@ class VideoProcessor:
                     if chunk:
                         f.write(chunk)
 
-            # 转换为 mp3
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(raw_path), "-vn", "-codec:a", "libmp3lame", "-qscale:a", "5", str(output_path)],
-                capture_output=True, timeout=120
-            )
+            # 使用统一的多策略音频提取
+            audio_result = self._run_ffmpeg_extract(raw_path, output_path)
             raw_path.unlink(missing_ok=True)
 
-            if output_path.exists() and output_path.stat().st_size > 1024:
-                return True
-            return False
+            return audio_result
         except Exception as e:
             logger.error(f"直接下载音频失败: {e}")
-            return False
+            return None
 
     def download_audio(self, video_url: str, video_id: str) -> Optional[str]:
         """下载抖音视频音频：优先 TikHub 直链，失败再试 yt-dlp"""
         audio_path = self.temp_dir / f"{video_id}.mp3"
 
-        if audio_path.exists():
-            logger.info(f"音频文件已存在: {audio_path}")
-            return str(audio_path)
+        # 检查是否已有缓存的音频文件（可能是任意格式）
+        for ext in ['.mp3', '.m4a', '.wav']:
+            existing = self.temp_dir / f"{video_id}{ext}"
+            if existing.exists():
+                logger.info(f"音频文件已存在: {existing}")
+                return str(existing)
 
         # 方案1：TikHub 直链（无需 Cookie，成功率更高）
         logger.info(f"尝试从 TikHub 获取音频直链 (video_id={video_id})")
         audio_url = self._get_audio_url_from_tikhub(video_id)
         if audio_url:
             logger.info(f"获取到直链，开始下载: {audio_url[:80]}...")
-            if self._download_audio_direct(audio_url, audio_path):
-                logger.info(f"音频下载完成: {audio_path}")
-                return str(audio_path)
+            direct_result = self._download_audio_direct(audio_url, audio_path)
+            if direct_result:
+                logger.info(f"音频下载完成: {direct_result}")
+                return direct_result
             logger.warning("TikHub 直链下载失败，尝试 yt-dlp")
         else:
             logger.warning("未获取到 TikHub 直链，尝试 yt-dlp")
@@ -753,16 +752,18 @@ class VideoProcessor:
                 return None
 
             # 查找实际生成的文件
-            for ext in ['.mp3', '.m4a', '.webm', '.opus']:
+            for ext in ['.mp3', '.m4a', '.webm', '.opus', '.wav']:
                 actual = audio_path.with_suffix(ext)
                 if actual.exists():
                     if ext != '.mp3':
                         # 转换为 mp3
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-i", str(actual), "-codec:a", "libmp3lame", "-qscale:a", "5", str(audio_path)],
-                            capture_output=True, timeout=60
-                        )
+                        converted = self._run_ffmpeg_extract(actual, audio_path)
                         actual.unlink()
+                        if converted:
+                            logger.info(f"音频下载完成: {converted}")
+                            return converted
+                        logger.warning(f"yt-dlp 文件 {ext} 转换失败，直接使用原文件")
+                        return str(actual)
                     logger.info(f"音频下载完成: {audio_path}")
                     return str(audio_path)
 
@@ -779,14 +780,79 @@ class VideoProcessor:
             logger.error(f"下载音频失败: {e}")
             return None
 
+    def _run_ffmpeg_extract(self, video_path: Path, audio_path: Path) -> Optional[str]:
+        """
+        用 ffmpeg 从视频文件提取音频，尝试多种策略。
+        返回成功生成的音频文件路径（可能是 .mp3/.m4a/.wav），失败返回 None。
+        """
+        # 策略列表：(输出后缀, ffmpeg参数, 说明)
+        strategies = [
+            (".mp3", ["-vn", "-acodec", "libmp3lame", "-qscale:a", "5"], "MP3 (libmp3lame)"),
+            (".m4a", ["-vn", "-acodec", "aac", "-b:a", "128k"], "AAC (m4a)"),
+            (".wav", ["-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1"], "WAV 16kHz mono"),
+        ]
+
+        for ext, extra_args, desc in strategies:
+            out_path = audio_path.with_suffix(ext)
+            cmd = ["ffmpeg", "-y", "-i", str(video_path)] + extra_args + [str(out_path)]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=180
+                )
+                if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1024:
+                    size_kb = out_path.stat().st_size / 1024
+                    logger.info(f"音频提取成功 [{desc}]: {out_path} ({size_kb:.1f} KB)")
+                    return str(out_path)
+
+                # 记录失败详情
+                err_tail = result.stderr[-500:] if result.stderr else "(无stderr)"
+                logger.warning(f"音频提取失败 [{desc}] (rc={result.returncode}): {err_tail}")
+            except subprocess.TimeoutExpired:
+                logger.warning(f"音频提取超时 [{desc}]")
+            except Exception as e:
+                logger.warning(f"音频提取异常 [{desc}]: {e}")
+
+        logger.error("所有音频提取策略均失败")
+        return None
+
+    def _probe_video(self, video_path: Path) -> bool:
+        """用 ffprobe 检查视频文件是否包含音频流，返回 True 表示有音频"""
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "stream=codec_type,codec_name", "-of", "json", str(video_path)],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                logger.warning(f"ffprobe 失败: {result.stderr[:300]}")
+                # ffprobe 失败不阻止后续尝试，ffmpeg 可能仍能处理
+                return True
+
+            probe_data = json.loads(result.stdout)
+            streams = probe_data.get("streams", [])
+            has_audio = any(s.get("codec_type") == "audio" for s in streams)
+            logger.info(f"ffprobe 检测到流: {streams}")
+            if not has_audio:
+                logger.error("视频文件中没有音频流")
+            return has_audio
+        except Exception as e:
+            logger.warning(f"ffprobe 异常: {e}")
+            return True  # 不阻止后续尝试
+
     def download_audio_from_video_url(self, video_url: str, video_id: str) -> Optional[str]:
-        """下载微信视频号视频并提取音频（视频号返回的是完整视频 URL）"""
+        """
+        下载微信视频号视频并提取音频。
+        尝试顺序：MP3 → AAC → WAV → 直接传视频文件给 Whisper。
+        """
         audio_path = self.temp_dir / f"{video_id}.mp3"
         video_path = self.temp_dir / f"{video_id}.mp4"
 
-        if audio_path.exists():
-            logger.info(f"音频文件已存在: {audio_path}")
-            return str(audio_path)
+        # 检查是否已有缓存的音频文件（可能是任意格式）
+        for ext in ['.mp3', '.m4a', '.wav']:
+            existing = self.temp_dir / f"{video_id}{ext}"
+            if existing.exists():
+                logger.info(f"音频文件已存在: {existing}")
+                return str(existing)
 
         if not video_url:
             logger.error("视频号 media_url 为空，无法下载")
@@ -802,6 +868,11 @@ class VideoProcessor:
             resp = requests.get(video_url, headers=headers, timeout=180, stream=True)
             resp.raise_for_status()
 
+            # 记录预期文件大小
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                logger.info(f"预期视频大小: {int(content_length) / 1024 / 1024:.2f} MB")
+
             total_size = 0
             with open(video_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
@@ -811,20 +882,43 @@ class VideoProcessor:
 
             logger.info(f"视频下载完成: {video_path} ({total_size / 1024 / 1024:.2f} MB)")
 
-            # 使用 ffmpeg 提取音频
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-codec:a", "libmp3lame", "-qscale:a", "5", str(audio_path)],
-                capture_output=True, timeout=180
-            )
+            # 检查文件完整性
+            if total_size < 10240:
+                logger.error(f"视频文件过小 ({total_size} bytes)，可能下载不完整")
+                video_path.unlink(missing_ok=True)
+                return None
 
-            # 删除视频文件，保留音频
+            # 检查是否为有效的视频文件（检查 magic bytes）
+            with open(video_path, 'rb') as f:
+                magic = f.read(12)
+            if len(magic) < 8 or (b'ftyp' not in magic and b'\x1a\x45\xdf\xa3' not in magic[:4]):
+                # 可能下载到了错误页面（HTML/JSON），读取前100字节查看
+                with open(video_path, 'rb') as f:
+                    head = f.read(200)
+                logger.error(f"视频文件不是有效的视频格式，前200字节: {head[:200]}")
+                video_path.unlink(missing_ok=True)
+                return None
+
+            # 用 ffprobe 检查音频流
+            self._probe_video(video_path)
+
+            # 尝试提取音频
+            audio_result = self._run_ffmpeg_extract(video_path, audio_path)
+
+            if audio_result:
+                # 提取成功，删除视频文件
+                video_path.unlink(missing_ok=True)
+                return audio_result
+
+            # 所有提取策略失败 —— 尝试直接传视频文件给 Whisper
+            # faster-whisper 底层用 ffmpeg 解码，可以直接处理视频文件
+            logger.warning("音频提取全部失败，尝试直接使用视频文件进行转录")
+            if video_path.exists() and video_path.stat().st_size > 10240:
+                logger.info(f"使用视频文件直接转录: {video_path}")
+                return str(video_path)
+
+            logger.error("视频文件不可用，无法转录")
             video_path.unlink(missing_ok=True)
-
-            if audio_path.exists() and audio_path.stat().st_size > 1024:
-                logger.info(f"音频提取完成: {audio_path}")
-                return str(audio_path)
-
-            logger.error("音频提取失败或文件为空")
             return None
 
         except subprocess.TimeoutExpired:
@@ -946,7 +1040,7 @@ class VideoProcessor:
 
     def cleanup(self, video_id: str):
         """清理临时音频/视频文件"""
-        for ext in ['.mp3', '.mp4', '.m4a', '.webm', '.opus']:
+        for ext in ['.mp3', '.mp4', '.m4a', '.wav', '.webm', '.opus']:
             f = self.temp_dir / f"{video_id}{ext}"
             if f.exists():
                 f.unlink()
