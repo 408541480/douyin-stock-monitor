@@ -48,7 +48,7 @@ push:
 
 # 运行配置
 runtime:
-  lookback_hours: 168              # 临时调整为7天，用于首次全链路测试；测试完成后改回24
+  lookback_hours: 240              # 临时调整为10天，用于首次全链路测试；测试完成后改回24
   max_videos_per_run: 1            # 测试期间只处理1条，避免消耗过多
   temp_dir: "./temp"               # 临时文件目录
   state_file: "state.json"         # 状态文件（记录已处理的视频）
