@@ -1,9 +1,14 @@
 name: Daily Douyin Stock Summary
 
+# ============================================
+# 每天 13:30 北京时间（05:30 UTC）自动运行
+# 目标：14:30 前推送到微信
+# 也可手动触发
+# ============================================
 on:
   schedule:
-    - cron: '0 6 * * *'
-  workflow_dispatch:
+    - cron: '30 5 * * *'        # 05:30 UTC = 13:30 北京时间
+  workflow_dispatch:             # 允许手动触发
 
 permissions:
   contents: write
@@ -14,24 +19,29 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # 1. 检出代码
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. 设置 Python 环境
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      # 3. 安装系统依赖（ffmpeg 用于音频处理）
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
 
+      # 4. 安装 Python 依赖
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 5. 运行总结脚本
       - name: Run summary script
         env:
           DOUYIN_UNIQUE_ID: ${{ secrets.DOUYIN_UNIQUE_ID }}
@@ -44,12 +54,14 @@ jobs:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
           WHISPER_MODEL_SIZE: ${{ secrets.WHISPER_MODEL_SIZE }}
+          WECHAT_ENABLED: 'true'
         run: python main.py
 
+      # 6. 提交状态文件（记录已处理的视频ID）
       - name: Commit state file
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: update processed video state"
-          file_pattern: state.json
+          file_pattern: state.json debug_wechat_response.json
           commit_user_name: "github-actions[bot]"
           commit_user_email: "github-actions[bot]@users.noreply.github.com"
