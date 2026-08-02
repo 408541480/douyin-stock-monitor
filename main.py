@@ -1434,7 +1434,57 @@ class VideoProcessor:
             logger.error(f"AI总结失败: {e}")
             return None
 
-    def cleanup(self, video_id: str):
+    def summarize_from_metadata(self, video: dict) -> Optional[str]:
+        """转录为空时，根据视频元数据（标题、时长、互动数据）从股市角度生成分析"""
+        if not self.config.llm_api_key:
+            return None
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.config.llm_api_key, base_url=self.config.llm_base_url)
+
+            title = video.get("title", "无标题")
+            duration = video.get("duration_sec", 0)
+            likes = video.get("likes", 0)
+            comments = video.get("comments", 0)
+
+            prompt = f"""你是专业的股市内容分析助手，分析对象是一位资深股市博主（"真如铁"/"笑傲江湖真如铁"）的视频。
+该博主的所有视频都与股市相关。这条视频的语音转录失败（可能视频极短或无语音），但请根据以下元数据从股市角度进行分析推断。
+
+视频元数据：
+- 标题：{title}
+- 时长：{duration}秒
+- 点赞数：{likes}
+- 评论数：{comments}
+
+请严格按照以下格式输出：
+
+**核心观点**
+{{根据标题和互动数据，推断作者可能传达的市场观点。即使是极短视频，标题也可能包含重要信号}}
+
+**市场方向**
+{{根据标题中的关键词推断市场方向（看多/看空/震荡），如标题含"抄底""加仓"等暗示方向}}
+
+**关键信息**
+{{分析标题中可能的市场信号、谐音梗、隐喻等。极短视频往往是博主快速传递某种市场情绪或操作信号}}
+
+**操作建议**
+{{根据推断给出可能的操作暗示。无法确定时写"需结合原视频确认"}}"""
+
+            response = client.chat.completions.create(
+                model=self.config.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.3
+            )
+
+            summary = response.choices[0].message.content.strip()
+            logger.info(f"元数据总结完成，长度: {len(summary)} 字符")
+            return summary
+
+        except Exception as e:
+            logger.error(f"元数据总结失败: {e}")
+            return None
         """清理临时音频/视频文件"""
         for ext in ['.mp3', '.mp4', '.m4a', '.wav', '.webm', '.opus']:
             f = self.temp_dir / f"{video_id}{ext}"
@@ -1630,10 +1680,9 @@ def process_single_video(video: dict, processor: VideoProcessor, config: Config,
     if transcript:
         summary = processor.summarize(video["title"], transcript, video.get("title", ""))
     else:
-        logger.warning("转录失败，使用视频标题生成简要摘要")
+        logger.warning("转录为空，使用视频元数据生成股市视角分析")
         if config.llm_api_key:
-            fallback = f"**核心观点**\n视频转录失败，无法获取详细内容。\n\n**视频标题**\n{video['title']}"
-            summary = fallback
+            summary = processor.summarize_from_metadata(video)
         else:
             summary = f"视频转录失败。标题: {video['title']}"
 
