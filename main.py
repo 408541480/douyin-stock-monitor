@@ -1485,6 +1485,8 @@ class VideoProcessor:
         except Exception as e:
             logger.error(f"元数据总结失败: {e}")
             return None
+
+    def cleanup(self, video_id: str):
         """清理临时音频/视频文件"""
         for ext in ['.mp3', '.mp4', '.m4a', '.wav', '.webm', '.opus']:
             f = self.temp_dir / f"{video_id}{ext}"
