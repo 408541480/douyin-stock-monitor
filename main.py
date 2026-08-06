@@ -1775,6 +1775,8 @@ def main():
             logger.info("推送成功！")
         else:
             logger.error("推送失败，请检查推送配置")
+            # 以非零退出码结束，使 GitHub Actions 步骤显示 failure
+            sys.exit(1)
 
         # 打印内容到控制台（便于调试）
         logger.info("\n" + "=" * 60)
